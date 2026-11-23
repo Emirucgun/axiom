@@ -1,0 +1,6 @@
+{
+  "name": "Axiom",
+  "description": "Engineering mastery and active-recall study workspace with 10-level PDF skill trees, Level Climb adaptive grading, 45-second First 2 Lines exam reflex training, and Feynman teach-back dialogues.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
