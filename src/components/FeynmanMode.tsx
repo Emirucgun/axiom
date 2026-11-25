@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { MessageSquare, Send, Award, RotateCcw, Loader2, CheckCircle2, AlertCircle, Clock } from 'lucide-react';
 import type { Course, FeynmanMessage, FeynmanTurnResponse, SkillLevel } from '../types';
-import { withTargetedPdfRetry } from '../utils/pdfStorage';
+import { withLevelPdfContext } from '../services/courseService';
 import { safeFetchJson } from '../utils/apiClient';
 import { MathText } from './MathText';
 import { MathHelperBar } from './MathHelperBar';
@@ -45,7 +45,7 @@ export const FeynmanMode: React.FC<FeynmanModeProps> = ({
     setRetryStatus(null);
 
     try {
-      const data = await withTargetedPdfRetry(
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>

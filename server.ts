@@ -1,10 +1,17 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import type { Part, GenerateContentResponse } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from './src/lib/database.types';
+
+// .env.local (shared with Vite) takes precedence over .env
+dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -153,6 +160,85 @@ function formatApiError(err: unknown): { status: number; message: string } {
   return { status: 500, message: extractedMessage || 'Unexpected server error while calling Gemini.' };
 }
 
+// ---------------------------------------------------------------------------
+// Supabase auth: every /api route (except /api/health) requires a valid user JWT
+// so public deployments can't burn the server-side GEMINI_API_KEY anonymously.
+// ---------------------------------------------------------------------------
+
+type UserSupabase = SupabaseClient<Database>;
+
+function getSupabaseConfig(): { url: string; anonKey: string } | null {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  return url && anonKey ? { url, anonKey } : null;
+}
+
+/** A Supabase client acting AS the caller, so Postgres RLS + Storage policies apply. */
+function createUserSupabase(accessToken: string): UserSupabase {
+  const config = getSupabaseConfig();
+  if (!config) {
+    throw new Error('Server is missing SUPABASE_URL / SUPABASE_ANON_KEY.');
+  }
+  return createClient<Database>(config.url, config.anonKey, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+}
+
+async function requireSupabaseUser(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) {
+    res.status(401).json({ error: 'Sign in required.' });
+    return;
+  }
+  if (!getSupabaseConfig()) {
+    res.status(500).json({ error: 'Server is missing SUPABASE_URL / SUPABASE_ANON_KEY.' });
+    return;
+  }
+  try {
+    const supabase = createUserSupabase(token);
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data.user) {
+      res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+      return;
+    }
+    res.locals.supabase = supabase;
+    res.locals.userId = data.user.id;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Auth check failed.' });
+  }
+}
+
+async function uploadPdfToGemini(
+  ai: GoogleGenAI,
+  blob: Blob,
+  displayName: string,
+): Promise<{ fileUri: string; mimeType: string; expirationTime?: string }> {
+  let uploaded = await withRetry(() =>
+    ai.files.upload({
+      file: blob,
+      config: { mimeType: 'application/pdf', displayName },
+    }),
+  );
+
+  let attempts = 0;
+  while (uploaded.state === 'PROCESSING' && uploaded.name && attempts < 15) {
+    await new Promise((r) => setTimeout(r, 800));
+    uploaded = await ai.files.get({ name: uploaded.name });
+    attempts++;
+  }
+  if (uploaded.state === 'FAILED' || !uploaded.uri) {
+    throw new Error(`Gemini failed to process PDF "${displayName}".`);
+  }
+  return {
+    fileUri: uploaded.uri,
+    mimeType: uploaded.mimeType || 'application/pdf',
+    expirationTime: uploaded.expirationTime,
+  };
+}
+
 function computeEloDelta(userElo: number, levelNumber: number, score: number, weight = 24): number {
   const levelRating = 950 + levelNumber * 80;
   const expected = 1 / (1 + Math.pow(10, (levelRating - userElo) / 400));
@@ -168,58 +254,73 @@ async function startServer() {
     res.json({ ok: true, hasKey: Boolean(process.env.GEMINI_API_KEY) });
   });
 
-  // 0. Upload individual PDF binary to Gemini Files API
-  app.post(
-    '/api/files/upload',
-    express.raw({ type: 'application/pdf', limit: '30mb' }),
-    async (req, res) => {
-      try {
-        const buffer = req.body as Buffer;
-        if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-          res.status(400).json({ error: 'Empty PDF binary body.' });
-          return;
-        }
-        const filename =
-          typeof req.query.filename === 'string' && req.query.filename.trim()
-            ? req.query.filename.trim()
-            : 'course-material.pdf';
+  // Everything below requires a signed-in Supabase user
+  app.use('/api', requireSupabaseUser);
 
-        const ai = createAiClient();
-        const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
-
-        let uploaded = await withRetry(() =>
-          ai.files.upload({
-            file: blob,
-            config: {
-              mimeType: 'application/pdf',
-              displayName: filename,
-            },
-          }),
-        );
-
-        let attempts = 0;
-        while (uploaded.state === 'PROCESSING' && uploaded.name && attempts < 15) {
-          await new Promise((r) => setTimeout(r, 800));
-          uploaded = await ai.files.get({ name: uploaded.name });
-          attempts++;
-        }
-
-        if (uploaded.state === 'FAILED') {
-          throw new Error(`Gemini failed to process PDF "${filename}".`);
-        }
-
-        res.json({
-          fileUri: uploaded.uri,
-          fileName: uploaded.name,
-          mimeType: uploaded.mimeType || 'application/pdf',
-          expirationTime: uploaded.expirationTime,
-        });
-      } catch (err) {
-        const formatted = formatApiError(err);
-        res.status(formatted.status).json({ error: formatted.message });
+  // 0. Hand a course PDF from Supabase Storage to the Gemini Files API.
+  //    The download runs under the caller's JWT, so RLS guarantees users can
+  //    only ever resolve their own PDFs. The resulting URI is cached on the row.
+  app.post('/api/files/from-storage', async (req, res) => {
+    try {
+      const { pdfId, force } = req.body as { pdfId?: string; force?: boolean };
+      if (!pdfId || typeof pdfId !== 'string') {
+        res.status(400).json({ error: 'pdfId is required.' });
+        return;
       }
-    },
-  );
+      const supabase = res.locals.supabase as UserSupabase;
+
+      const { data: row, error: rowError } = await supabase
+        .from('course_pdfs')
+        .select('id, file_name, storage_path, gemini_file_uri, gemini_file_expires_at')
+        .eq('id', pdfId)
+        .maybeSingle();
+      if (rowError) throw new Error(rowError.message);
+      if (!row) {
+        res.status(404).json({ error: 'PDF not found.' });
+        return;
+      }
+
+      const fiveMinutesFromNow = Date.now() + 5 * 60 * 1000;
+      const cachedIsFresh =
+        Boolean(row.gemini_file_uri) &&
+        (!row.gemini_file_expires_at || new Date(row.gemini_file_expires_at).getTime() > fiveMinutesFromNow);
+      if (!force && cachedIsFresh && row.gemini_file_uri) {
+        res.json({
+          fileUri: row.gemini_file_uri,
+          mimeType: 'application/pdf',
+          expirationTime: row.gemini_file_expires_at ?? undefined,
+        });
+        return;
+      }
+
+      const { data: blob, error: downloadError } = await supabase.storage
+        .from('course-materials')
+        .download(row.storage_path);
+      if (downloadError || !blob) {
+        throw new Error(`Could not read "${row.file_name}" from storage: ${downloadError?.message ?? 'empty file'}`);
+      }
+
+      const ai = createAiClient();
+      const pdfBlob = blob.type === 'application/pdf' ? blob : new Blob([await blob.arrayBuffer()], { type: 'application/pdf' });
+      const uploaded = await uploadPdfToGemini(ai, pdfBlob, row.file_name);
+
+      const { error: updateError } = await supabase
+        .from('course_pdfs')
+        .update({
+          gemini_file_uri: uploaded.fileUri,
+          gemini_file_expires_at: uploaded.expirationTime ?? null,
+        })
+        .eq('id', row.id);
+      if (updateError) {
+        console.warn(`Failed to cache Gemini URI for ${row.id}: ${updateError.message}`);
+      }
+
+      res.json(uploaded);
+    } catch (err) {
+      const formatted = formatApiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
 
   // 1A. Step 1 of Two-Step Chunked Ingestion: Extract compact Topic & Formula Syllabus from a small batch (up to 5 PDFs)
   app.post('/api/roadmap/extract-batch', async (req, res) => {

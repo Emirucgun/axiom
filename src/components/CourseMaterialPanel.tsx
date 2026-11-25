@@ -10,16 +10,13 @@ import {
 } from 'lucide-react';
 import type { Course, DocCategory, PdfAttachmentMeta } from '../types';
 import {
-  clearCourseFileUrisInDb,
-  deletePdfFromDb,
+  deleteCoursePdf,
   formatBytes,
-  getCoursePdfsForApi,
-  isStaleFileUriError,
-  saveCoursePdf,
-  updatePdfCategoryInDb,
-} from '../utils/pdfStorage';
-import { clearCourseLevelCache } from '../utils/levelCache';
-import { safeFetchJson } from '../utils/apiClient';
+  generateRoadmap,
+  inferDocCategory,
+  updatePdfCategory,
+  uploadCoursePdf,
+} from '../services/courseService';
 
 interface CourseMaterialPanelProps {
   course: Course;
@@ -33,18 +30,6 @@ const CATEGORY_LABELS: Record<DocCategory, string> = {
   past_exam: 'Past Exam',
   problem_set: 'Problem Set',
 };
-
-const PDF_BATCH_SIZE = 5;
-
-interface ExtractBatchResponse {
-  detectedLanguage: string;
-  batchSummary: string;
-  fileTopics: Array<{
-    fileName: string;
-    keywords: string[];
-    summary: string;
-  }>;
-}
 
 export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
   course,
@@ -73,6 +58,8 @@ export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
     setErrorMsg(null);
     setUploading(true);
 
+    const added: PdfAttachmentMeta[] = [];
+    const failures: string[] = [];
     try {
       const pdfFiles = Array.from(fileList).filter(
         (f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'),
@@ -82,40 +69,30 @@ export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
       }
 
       setUploadProgress({ done: 0, total: pdfFiles.length });
-      const addedMeta: PdfAttachmentMeta[] = [];
       const concurrency = 3;
 
       for (let i = 0; i < pdfFiles.length; i += concurrency) {
         const chunk = pdfFiles.slice(i, i + concurrency);
-        const results = await Promise.all(
-          chunk.map(async (file) => {
-            const lower = file.name.toLowerCase();
-            const inferredCategory: DocCategory =
-              lower.includes('exam') ||
-              lower.includes('midterm') ||
-              lower.includes('final') ||
-              lower.includes('quiz')
-                ? 'past_exam'
-                : lower.includes('slide') || lower.includes('lec')
-                  ? 'slides'
-                  : lower.includes('hw') || lower.includes('ps') || lower.includes('problem')
-                    ? 'problem_set'
-                    : 'lecture_notes';
-
-            return saveCoursePdf(course.id, file, inferredCategory);
-          }),
+        // Pass the growing list so duplicate-name checks include this session's uploads
+        const snapshot: Course = { ...course, pdfFiles: [...course.pdfFiles, ...added] };
+        const results = await Promise.allSettled(
+          chunk.map((file) => uploadCoursePdf(snapshot, file, inferDocCategory(file.name))),
         );
-        addedMeta.push(...results);
+        for (const r of results) {
+          if (r.status === 'fulfilled') added.push(r.value);
+          else failures.push(r.reason instanceof Error ? r.reason.message : String(r.reason));
+        }
         setUploadProgress({ done: Math.min(pdfFiles.length, i + chunk.length), total: pdfFiles.length });
       }
-
-      onUpdateCourse({
-        ...course,
-        pdfFiles: [...course.pdfFiles, ...addedMeta],
-      });
+      if (failures.length > 0) {
+        reportError(failures.join(' '));
+      }
     } catch (err) {
-      reportError(err instanceof Error ? err.message : 'Failed to store PDF file.');
+      reportError(err instanceof Error ? err.message : 'Failed to upload PDF file.');
     } finally {
+      if (added.length > 0) {
+        onUpdateCourse({ ...course, pdfFiles: [...course.pdfFiles, ...added] });
+      }
       setUploading(false);
       setUploadProgress(null);
       if (fileInputRef.current) {
@@ -125,183 +102,40 @@ export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
   };
 
   const handleCategoryChange = async (pdfId: string, nextCat: DocCategory) => {
-    await updatePdfCategoryInDb(pdfId, nextCat);
-    onUpdateCourse({
-      ...course,
-      pdfFiles: course.pdfFiles.map((p) => (p.id === pdfId ? { ...p, docCategory: nextCat } : p)),
-    });
+    try {
+      await updatePdfCategory(pdfId, nextCat);
+      onUpdateCourse({
+        ...course,
+        pdfFiles: course.pdfFiles.map((p) => (p.id === pdfId ? { ...p, docCategory: nextCat } : p)),
+      });
+    } catch (err) {
+      reportError(err instanceof Error ? err.message : 'Failed to update document type.');
+    }
   };
 
-  const handleDeletePdf = async (pdfId: string) => {
-    await deletePdfFromDb(pdfId);
-    onUpdateCourse({
-      ...course,
-      pdfFiles: course.pdfFiles.filter((p) => p.id !== pdfId),
-    });
+  const handleDeletePdf = async (pdf: PdfAttachmentMeta) => {
+    try {
+      await deleteCoursePdf(pdf);
+      onUpdateCourse({
+        ...course,
+        pdfFiles: course.pdfFiles.filter((p) => p.id !== pdf.id),
+      });
+    } catch (err) {
+      reportError(err instanceof Error ? err.message : 'Failed to delete PDF.');
+    }
   };
 
   const handleGenerateRoadmap = async () => {
     setErrorMsg(null);
     setConfirmRegenerate(false);
     setGenerating(true);
-    setRoadmapProgress({ label: 'Preparing PDF files from IndexedDB…', percent: 5 });
+    setRoadmapProgress({ label: 'Preparing PDFs from cloud storage…', percent: 5 });
 
     try {
-      let pdfs = await getCoursePdfsForApi(course.id);
-      if (pdfs.length === 0) {
-        throw new Error(
-          'No active PDF binaries found in browser storage. Please attach your course PDFs first.',
-        );
-      }
-
-      // Step 1: Chunk PDFs into batches of 5 to prevent heavy single-request timeouts
-      const totalBatches = Math.ceil(pdfs.length / PDF_BATCH_SIZE);
-      const batchSyllabi: string[] = [];
-      const topicByFile = new Map<string, { keywords: string[]; summary: string }>();
-      let detectedLang = course.detectedLanguage || 'English';
-      let didRefreshUris = false;
-
-      for (let b = 0; b < totalBatches; b++) {
-        let batch = pdfs.slice(b * PDF_BATCH_SIZE, (b + 1) * PDF_BATCH_SIZE);
-        const startPct = 10 + Math.round((b / totalBatches) * 70);
-        setRoadmapProgress({
-          label: `Extracting topics from batch ${b + 1}/${totalBatches} (${batch.length} PDF${batch.length > 1 ? 's' : ''})…`,
-          percent: startPct,
-        });
-
-        let extracted: ExtractBatchResponse;
-        try {
-          extracted = await safeFetchJson<ExtractBatchResponse>('/api/roadmap/extract-batch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            timeoutMs: 60000,
-            onRetryStatus: (statusMsg) => {
-              if (statusMsg) {
-                setRoadmapProgress({
-                  label: `Batch ${b + 1}/${totalBatches}: ${statusMsg}`,
-                  percent: startPct,
-                });
-              }
-            },
-            body: JSON.stringify({
-              courseName: course.name,
-              courseCode: course.code,
-              batchIndex: b,
-              totalBatches,
-              pdfs: batch,
-            }),
-          });
-        } catch (batchErr) {
-          if (!didRefreshUris && isStaleFileUriError(batchErr)) {
-            didRefreshUris = true;
-            setRoadmapProgress({
-              label: `Refreshing PDF file tokens for batch ${b + 1}/${totalBatches}…`,
-              percent: startPct,
-            });
-            await clearCourseFileUrisInDb(course.id);
-            pdfs = await getCoursePdfsForApi(course.id);
-            batch = pdfs.slice(b * PDF_BATCH_SIZE, (b + 1) * PDF_BATCH_SIZE);
-            extracted = await safeFetchJson<ExtractBatchResponse>('/api/roadmap/extract-batch', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              timeoutMs: 60000,
-              onRetryStatus: (statusMsg) => {
-                if (statusMsg) {
-                  setRoadmapProgress({
-                    label: `Batch ${b + 1}/${totalBatches}: ${statusMsg}`,
-                    percent: startPct,
-                  });
-                }
-              },
-              body: JSON.stringify({
-                courseName: course.name,
-                courseCode: course.code,
-                batchIndex: b,
-                totalBatches,
-                pdfs: batch,
-              }),
-            });
-          } else {
-            throw batchErr;
-          }
-        }
-
-        if (b === 0 && extracted.detectedLanguage) {
-          detectedLang = extracted.detectedLanguage;
-        }
-        if (extracted.batchSummary) {
-          batchSyllabi.push(`### Batch ${b + 1}\n${extracted.batchSummary}`);
-        }
-        for (const ft of extracted.fileTopics ?? []) {
-          topicByFile.set(ft.fileName.toLowerCase(), {
-            keywords: ft.keywords ?? [],
-            summary: ft.summary ?? '',
-          });
-        }
-      }
-
-      const updatedPdfFiles = course.pdfFiles.map((meta) => {
-        const matched = topicByFile.get(meta.name.toLowerCase());
-        return matched
-          ? {
-              ...meta,
-              extractedTopics: matched.keywords,
-              extractedSummary: matched.summary,
-            }
-          : meta;
-      });
-
-      const combinedSyllabus = batchSyllabi.join('\n\n');
-
-      // Step 2: Synthesize 10-Level Sequential Skill Tree strictly from lightweight combined syllabus text
-      setRoadmapProgress({
-        label: 'Synthesizing 10-Level Sequential Skill Tree…',
-        percent: 88,
-      });
-
-      const fileManifest = updatedPdfFiles.map((f) => ({
-        name: f.name,
-        docCategory: f.docCategory,
-        keywords: f.extractedTopics ?? [],
-        summary: f.extractedSummary ?? '',
-      }));
-
-      const data = await safeFetchJson<{
-        detectedLanguage?: string;
-        courseDigest?: string;
-        levels?: Course['levels'];
-      }>('/api/roadmap/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        timeoutMs: 45000,
-        onRetryStatus: (statusMsg) => {
-          if (statusMsg) {
-            setRoadmapProgress({
-              label: `Synthesizing 10-Level Tree: ${statusMsg}`,
-              percent: 88,
-            });
-          }
-        },
-        body: JSON.stringify({
-          courseName: course.name,
-          courseCode: course.code,
-          detectedLanguage: detectedLang,
-          combinedSyllabus,
-          fileManifest,
-        }),
-      });
-
-      clearCourseLevelCache(course.id);
-      setRoadmapProgress({ label: '10-Level Skill Tree ready', percent: 100 });
-
-      onUpdateCourse({
-        ...course,
-        detectedLanguage: data.detectedLanguage || detectedLang,
-        courseDigest: data.courseDigest || combinedSyllabus,
-        batchSyllabi,
-        pdfFiles: updatedPdfFiles,
-        levels: data.levels || [],
-      });
+      const updated = await generateRoadmap(course, (label, percent) =>
+        setRoadmapProgress({ label, percent }),
+      );
+      onUpdateCourse(updated);
     } catch (err) {
       reportError(err instanceof Error ? err.message : 'Roadmap generation failed.');
     } finally {
@@ -320,7 +154,7 @@ export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
             Course Materials &amp; Syllabus Ingestion
           </h3>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Upload lecture slides, notes, and past exam PDFs. Stored in IndexedDB and extracted in 5-PDF batches to prevent timeouts.
+            Upload lecture slides, notes, and past exam PDFs. Stored securely in your cloud account and extracted in 5-PDF batches to prevent timeouts.
           </p>
         </div>
 
@@ -475,7 +309,7 @@ export const CourseMaterialPanel: React.FC<CourseMaterialPanelProps> = ({
                 <button
                   type="button"
                   title="Remove PDF"
-                  onClick={() => handleDeletePdf(pdf.id)}
+                  onClick={() => handleDeletePdf(pdf)}
                   className="p-1 rounded text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
                 >
                   <Trash2 className="w-3.5 h-3.5" />

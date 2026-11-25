@@ -1,6 +1,9 @@
-import type { AppState, Course } from '../types';
+/**
+ * Device-local preferences and pure helpers. All study data lives in Supabase
+ * (see src/services); only the light/dark theme choice is kept per browser.
+ */
+import type { Course } from '../types';
 
-const STORAGE_KEY = 'axiom_mastery_state_v1';
 const THEME_KEY = 'axiom_theme_v1';
 
 export function getTodayIsoDate(): string {
@@ -9,52 +12,6 @@ export function getTodayIsoDate(): string {
   const m = String(now.getMonth() + 1).padStart(2, '0');
   const d = String(now.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
-}
-
-function getYesterdayIsoDate(): string {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-export function createInitialState(): AppState {
-  return {
-    version: 1,
-    elo: 1200,
-    streakDays: 0,
-    lastStudyDate: null,
-    studyDates: [],
-    courses: [],
-    activeCourseId: null,
-    sessions: [],
-  };
-}
-
-export function loadAppState(): AppState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return createInitialState();
-    const parsed = JSON.parse(raw) as Partial<AppState>;
-    return {
-      version: 1,
-      elo: typeof parsed.elo === 'number' ? parsed.elo : 1200,
-      streakDays: typeof parsed.streakDays === 'number' ? parsed.streakDays : 0,
-      lastStudyDate: parsed.lastStudyDate ?? null,
-      studyDates: Array.isArray(parsed.studyDates) ? parsed.studyDates : [],
-      courses: Array.isArray(parsed.courses) ? parsed.courses : [],
-      activeCourseId: parsed.activeCourseId ?? null,
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-    };
-  } catch {
-    return createInitialState();
-  }
-}
-
-export function saveAppState(state: AppState): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
 export function loadThemePreference(): 'light' | 'dark' {
@@ -71,29 +28,11 @@ export function loadThemePreference(): 'light' | 'dark' {
 }
 
 export function saveThemePreference(theme: 'light' | 'dark'): void {
-  localStorage.setItem(THEME_KEY, theme);
-}
-
-export function recordDailyActivity(state: AppState): Pick<AppState, 'streakDays' | 'lastStudyDate' | 'studyDates'> {
-  const today = getTodayIsoDate();
-  const yesterday = getYesterdayIsoDate();
-  const datesSet = new Set(state.studyDates);
-  datesSet.add(today);
-
-  let nextStreak = state.streakDays;
-  if (state.lastStudyDate === today) {
-    nextStreak = Math.max(1, state.streakDays);
-  } else if (state.lastStudyDate === yesterday) {
-    nextStreak = state.streakDays + 1;
-  } else {
-    nextStreak = 1;
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch {
+    // Storage can be unavailable (private mode); theme just won't persist.
   }
-
-  return {
-    streakDays: nextStreak,
-    lastStudyDate: today,
-    studyDates: Array.from(datesSet).slice(-90),
-  };
 }
 
 export function computeCourseReadiness(course: Course | null): number {
@@ -115,23 +54,4 @@ export function computeCourseReadiness(course: Course | null): number {
   }
 
   return weightedTotal > 0 ? Math.round((weightedEarned / weightedTotal) * 100) : 0;
-}
-
-export function validateImportedState(data: unknown): AppState | null {
-  if (!data || typeof data !== 'object') return null;
-  const obj = data as Record<string, unknown>;
-  if (!Array.isArray(obj.courses)) return null;
-
-  return {
-    version: 1,
-    elo: typeof obj.elo === 'number' ? obj.elo : 1200,
-    streakDays: typeof obj.streakDays === 'number' ? obj.streakDays : 0,
-    lastStudyDate: typeof obj.lastStudyDate === 'string' ? obj.lastStudyDate : null,
-    studyDates: Array.isArray(obj.studyDates)
-      ? obj.studyDates.filter((d): d is string => typeof d === 'string')
-      : [],
-    courses: obj.courses as Course[],
-    activeCourseId: typeof obj.activeCourseId === 'string' ? obj.activeCourseId : null,
-    sessions: Array.isArray(obj.sessions) ? obj.sessions : [],
-  };
 }

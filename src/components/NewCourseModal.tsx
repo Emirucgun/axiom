@@ -1,11 +1,10 @@
 import React, { useState } from 'react';
 import { X } from 'lucide-react';
-import type { Course } from '../types';
 
 interface NewCourseModalProps {
   open: boolean;
   onClose: () => void;
-  onCreate: (course: Course) => void;
+  onCreate: (input: { name: string; code: string; examDate?: string }) => Promise<void>;
 }
 
 const PRESETS = [
@@ -20,30 +19,29 @@ export const NewCourseModal: React.FC<NewCourseModalProps> = ({ open, onClose, o
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
   const [examDate, setExamDate] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   if (!open) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || submitting) return;
 
-    const newCourse: Course = {
-      id: `course_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-      name: trimmed,
-      code: code.trim() || 'ENG',
-      examDate: examDate || undefined,
-      createdAt: new Date().toISOString(),
-      detectedLanguage: 'English',
-      courseDigest: '',
-      pdfFiles: [],
-      levels: [],
-    };
-    onCreate(newCourse);
-    setName('');
-    setCode('');
-    setExamDate('');
-    onClose();
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onCreate({ name: trimmed, code: code.trim() || 'ENG', examDate: examDate || undefined });
+      setName('');
+      setCode('');
+      setExamDate('');
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create course.');
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -127,6 +125,12 @@ export const NewCourseModal: React.FC<NewCourseModalProps> = ({ open, onClose, o
             </div>
           </div>
 
+          {error && (
+            <p role="alert" className="text-xs text-red-600 dark:text-red-400">
+              {error}
+            </p>
+          )}
+
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
               type="button"
@@ -137,9 +141,10 @@ export const NewCourseModal: React.FC<NewCourseModalProps> = ({ open, onClose, o
             </button>
             <button
               type="submit"
-              className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-medium cursor-pointer"
+              disabled={submitting}
+              className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 disabled:opacity-60 text-white text-xs font-medium cursor-pointer"
             >
-              Create Course
+              {submitting ? 'Creating…' : 'Create Course'}
             </button>
           </div>
         </form>

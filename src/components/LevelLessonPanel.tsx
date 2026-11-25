@@ -13,14 +13,13 @@ import {
   Clock,
 } from 'lucide-react';
 import type { Course, LessonDoubtMessage, LevelLesson, SkillLevel } from '../types';
-import { withTargetedPdfRetry } from '../utils/pdfStorage';
 import { safeFetchJson } from '../utils/apiClient';
 import {
-  getCachedLessonDoubts,
-  getCachedLevelLesson,
-  saveCachedLessonDoubts,
-  saveCachedLevelLesson,
-} from '../utils/levelCache';
+  getLevelCache,
+  saveLessonDoubts,
+  saveLevelLesson,
+  withLevelPdfContext,
+} from '../services/courseService';
 import { MathText } from './MathText';
 
 interface LevelLessonPanelProps {
@@ -36,12 +35,8 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
   onReadyToTest,
   onNotifyError,
 }) => {
-  const [lesson, setLesson] = useState<LevelLesson | null>(() =>
-    getCachedLevelLesson(course.id, level.levelNumber),
-  );
-  const [doubts, setDoubts] = useState<LessonDoubtMessage[]>(() =>
-    getCachedLessonDoubts(course.id, level.levelNumber),
-  );
+  const [lesson, setLesson] = useState<LevelLesson | null>(null);
+  const [doubts, setDoubts] = useState<LessonDoubtMessage[]>([]);
   const [doubtInput, setDoubtInput] = useState('');
   const [loadingLesson, setLoadingLesson] = useState(false);
   const [loadingDoubt, setLoadingDoubt] = useState(false);
@@ -57,21 +52,26 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
   }, []);
 
   const fetchLesson = async (forceRefresh = false) => {
-    if (!forceRefresh) {
-      const cached = getCachedLevelLesson(course.id, level.levelNumber);
-      if (cached) {
-        setLesson(cached);
-        setDoubts(getCachedLessonDoubts(course.id, level.levelNumber));
-        return;
-      }
-    }
-
     setLoadingLesson(true);
     setErrorMsg(null);
     setRetryStatus(null);
 
     try {
-      const data = await withTargetedPdfRetry(
+      // 1) Supabase cache first — generated once, shared across all devices
+      if (!forceRefresh) {
+        setRetryStatus('Checking your saved lesson…');
+        const cached = await getLevelCache(level.id);
+        if (!mountedRef.current) return;
+        if (cached.lesson) {
+          setLesson(cached.lesson);
+          setDoubts(cached.doubts);
+          return;
+        }
+        setRetryStatus(null);
+      }
+
+      // 2) Cache miss: pull only this level's 1–2 PDFs and generate via Gemini
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>
@@ -95,11 +95,11 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
 
       if (!mountedRef.current) return;
       setLesson(data);
-      saveCachedLevelLesson(course.id, level.levelNumber, data);
       if (forceRefresh) {
         setDoubts([]);
-        saveCachedLessonDoubts(course.id, level.levelNumber, []);
       }
+      // 3) Persist back to the levels row so every device sees it instantly
+      await saveLevelLesson(level.id, data, forceRefresh);
     } catch (err) {
       if (!mountedRef.current) return;
       const msg = err instanceof Error ? err.message : 'Unable to generate mini-lesson.';
@@ -114,17 +114,10 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
   };
 
   useEffect(() => {
-    const cached = getCachedLevelLesson(course.id, level.levelNumber);
-    if (cached) {
-      setLesson(cached);
-      setDoubts(getCachedLessonDoubts(course.id, level.levelNumber));
-      setErrorMsg(null);
-      return;
-    }
     setLesson(null);
     setDoubts([]);
     fetchLesson(false);
-  }, [course.id, level.levelNumber]);
+  }, [course.id, level.id]);
 
   const handleAskDoubt = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -146,7 +139,7 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
         `Worked Example: ${lesson.workedExample.problemStatement} -> ${lesson.workedExample.finalAnswer}`,
       ].join('\n');
 
-      const res = await withTargetedPdfRetry(
+      const res = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>
@@ -177,7 +170,7 @@ export const LevelLessonPanel: React.FC<LevelLessonPanelProps> = ({
       if (!mountedRef.current) return;
       const updated = [...nextWithUser, { role: 'ai' as const, content: res.answer }];
       setDoubts(updated);
-      saveCachedLessonDoubts(course.id, level.levelNumber, updated);
+      await saveLessonDoubts(level.id, updated);
     } catch (err) {
       if (!mountedRef.current) return;
       const msg = err instanceof Error ? err.message : 'Unable to answer doubt right now.';
