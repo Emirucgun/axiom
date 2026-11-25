@@ -397,17 +397,54 @@ export function selectLevelPdfs(course: Course, level: SkillLevel, maxPdfs = 2):
 }
 
 /**
+ * Picks the past exam (or, failing that, problem set) that best matches the
+ * level, so question generators can mirror the real exam style. Returns null
+ * when the course has no such material or it is already in `exclude`.
+ */
+export function selectExamReferencePdf(
+  course: Course,
+  level: SkillLevel,
+  exclude: PdfAttachmentMeta[] = [],
+): PdfAttachmentMeta | null {
+  const candidates = course.pdfFiles.filter(
+    (r) => (r.docCategory === 'past_exam' || r.docCategory === 'problem_set') && !exclude.includes(r),
+  );
+  if (candidates.length === 0) return null;
+  if (exclude.some((r) => r.docCategory === 'past_exam')) return null;
+
+  const query = `${level.title} ${level.summary} ${level.objectives.join(' ')} ${level.keyFormulas.join(' ')}`.toLowerCase();
+  const scored = candidates.map((rec) => {
+    let score = rec.docCategory === 'past_exam' ? 100 : 0;
+    for (const topic of rec.extractedTopics ?? []) {
+      if (topic && query.includes(topic.toLowerCase())) score += 10;
+    }
+    return { rec, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].rec;
+}
+
+/**
  * Runs `fn` with Gemini payloads for ONLY the level's matched PDFs. If Gemini
  * reports an expired / missing file handle, re-pulls those PDFs from Storage
  * once and retries.
+ *
+ * With `includeExamReference`, one past exam / problem set is appended (when
+ * the course has one) so generated questions follow the real exam style.
  */
 export async function withLevelPdfContext<T>(
   course: Course,
   level: SkillLevel,
   fn: (pdfs: PdfPayload[]) => Promise<T>,
   maxPdfs = 2,
+  options: { includeExamReference?: boolean } = {},
 ): Promise<T> {
-  const selected = selectLevelPdfs(course, level, maxPdfs);
+  // Copy: selectLevelPdfs may return course.pdfFiles itself.
+  const selected = [...selectLevelPdfs(course, level, maxPdfs)];
+  if (options.includeExamReference) {
+    const examRef = selectExamReferencePdf(course, level, selected);
+    if (examRef) selected.push(examRef);
+  }
   const pdfs = await resolveGeminiPayloads(selected);
   try {
     return await fn(pdfs);
