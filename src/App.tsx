@@ -18,6 +18,7 @@ import {
   LogOut,
   Loader2,
   TrendingUp,
+  KeyRound,
 } from 'lucide-react';
 import type {
   Course,
@@ -32,7 +33,16 @@ import {
   computeCourseReadiness,
 } from './utils/persistence';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
-import { createCourse, deleteCourse, fetchCourse, listCourses } from './services/courseService';
+import {
+  clearGeminiUriCache,
+  createCourse,
+  deleteCourse,
+  fetchCourse,
+  listCourses,
+} from './services/courseService';
+import type { ApiKeyStatus } from './services/apiKeyService';
+import { getApiKeyStatus, isAiAvailable } from './services/apiKeyService';
+import { ApiKeySettings } from './components/ApiKeySettings';
 import {
   applyEloDelta,
   buildExportBackup,
@@ -115,6 +125,8 @@ function Workspace() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [confirmDeleteCourseId, setConfirmDeleteCourseId] = useState<string | null>(null);
   const [deletingCourseId, setDeletingCourseId] = useState<string | null>(null);
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null);
+  const [apiKeyOpen, setApiKeyOpen] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{
     type: 'success' | 'error';
     text: string;
@@ -145,7 +157,23 @@ function Workspace() {
 
   useEffect(() => {
     loadWorkspace();
+    // BYOK status is non-blocking: the workspace works without it
+    getApiKeyStatus()
+      .then(setApiKeyStatus)
+      .catch(() => setApiKeyStatus(null));
   }, [loadWorkspace]);
+
+  const handleApiKeyChanged = async (next: ApiKeyStatus) => {
+    setApiKeyStatus(next);
+    // The server cleared cached Gemini file handles (they're tied to the key);
+    // drop ours too and reload PDF metadata so nothing stale is reused.
+    clearGeminiUriCache();
+    try {
+      setCourses(await listCourses());
+    } catch {
+      // Non-fatal: stale handles are also refreshed on first use
+    }
+  };
 
   const activeCourse =
     courses.find((c) => c.id === activeCourseId) ?? courses[0] ?? null;
@@ -455,6 +483,25 @@ function Workspace() {
           </div>
           <button
             type="button"
+            onClick={() => setApiKeyOpen(true)}
+            title="Gemini API key (bring your own key)"
+            className="relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">API Key</span>
+            <span
+              aria-hidden="true"
+              className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ring-2 ring-white dark:ring-[#0F172A] ${
+                apiKeyStatus?.hasKey
+                  ? 'bg-emerald-500'
+                  : isAiAvailable(apiKeyStatus)
+                    ? 'bg-sky-500'
+                    : 'bg-amber-500'
+              }`}
+            />
+          </button>
+          <button
+            type="button"
             onClick={handleExportJson}
             title="Download a JSON backup of your courses and progress"
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -610,6 +657,23 @@ function Workspace() {
               </button>
             ))}
           </div>
+
+          {/* BYOK prompt when no Gemini key is available */}
+          {apiKeyStatus && !isAiAvailable(apiKeyStatus) && (
+            <div className="rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-900 dark:text-amber-100 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <KeyRound className="w-4 h-4 shrink-0" />
+                <span>Add your Gemini API key to generate roadmaps, lessons and graded questions.</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setApiKeyOpen(true)}
+                className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-medium whitespace-nowrap cursor-pointer"
+              >
+                Add API key
+              </button>
+            </div>
+          )}
 
           {/* Toast feedback banner */}
           {bannerMessage && (
@@ -1099,6 +1163,13 @@ function Workspace() {
           )}
         </main>
       </div>
+
+      <ApiKeySettings
+        open={apiKeyOpen}
+        status={apiKeyStatus}
+        onClose={() => setApiKeyOpen(false)}
+        onChanged={handleApiKeyChanged}
+      />
 
       <NewCourseModal
         open={newCourseOpen}

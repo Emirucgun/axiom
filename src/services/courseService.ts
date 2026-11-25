@@ -282,6 +282,11 @@ export async function deleteCoursePdf(pdf: PdfAttachmentMeta): Promise<void> {
 
 const geminiUriCache = new Map<string, { fileUri: string; expiresAt?: string }>();
 
+/** Gemini file handles belong to the API key's project; call after the key changes. */
+export function clearGeminiUriCache(): void {
+  geminiUriCache.clear();
+}
+
 function isUriFresh(expiresAt?: string): boolean {
   return !expiresAt || new Date(expiresAt).getTime() > Date.now() + 5 * 60 * 1000;
 }

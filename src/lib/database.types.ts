@@ -1,5 +1,5 @@
 /**
- * Typed schema for supabase/migrations/001_initial_schema.sql.
+ * Typed schema for supabase/migrations/001_initial_schema.sql + 002_byok_api_keys.sql.
  *
  * Hand-maintained to match the migration. Once your project is linked you can
  * regenerate it with:
@@ -190,6 +190,26 @@ export interface Database {
             referencedColumns: ['id'];
           },
         ];
+      };
+      user_api_keys: {
+        Row: {
+          user_id: string;
+          provider: 'gemini';
+          encrypted_key: string;
+          key_hint: string;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          user_id: string;
+          provider?: 'gemini';
+          encrypted_key: string;
+          key_hint: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Database['public']['Tables']['user_api_keys']['Insert']>;
+        Relationships: [];
       };
     };
     Views: { [_ in never]: never };
