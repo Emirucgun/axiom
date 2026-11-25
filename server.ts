@@ -3,7 +3,7 @@ import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import http from 'http';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import crypto from 'crypto';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import type { Part, GenerateContentResponse } from '@google/genai';
@@ -340,7 +340,12 @@ function computeEloDelta(userElo: number, levelNumber: number, score: number, we
   return Math.round(weight * (actual - expected));
 }
 
-async function startServer() {
+/**
+ * Builds the Express app with every /api route. Shared by:
+ *  - local dev / `node server.ts` (startServer below adds Vite or static files)
+ *  - Vercel, where api/index.ts exports it as a serverless function
+ */
+export function createApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
@@ -1459,6 +1464,11 @@ Instructions:
     },
   );
 
+  return app;
+}
+
+async function startServer() {
+  const app = createApp();
   const httpServer = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {
@@ -1485,4 +1495,9 @@ Instructions:
   });
 }
 
-startServer();
+// Only listen when run directly (tsx server.ts / node server.ts), never when
+// imported by the Vercel function in api/index.ts.
+const isDirectRun = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  startServer();
+}
