@@ -1,3 +1,5 @@
+import { getAccessToken } from '../lib/supabase';
+
 function isServerWarmupResponse(status: number, rawText: string, contentType: string | null): boolean {
   const lower = rawText.toLowerCase();
   if (lower.includes('starting server')) {
@@ -34,6 +36,13 @@ export async function safeFetchJson<T>(url: string, options: SafeFetchOptions = 
 
   let rateLimitRetries = 0;
 
+  // Every /api route on our server requires a Supabase session (protects Gemini quota).
+  const token = await getAccessToken();
+  const headers = new Headers(fetchInit.headers);
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   for (let attempt = 0; attempt < maxWarmupAttempts + RATE_LIMIT_DELAYS_MS.length; attempt++) {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -44,6 +53,7 @@ export async function safeFetchJson<T>(url: string, options: SafeFetchOptions = 
       res = await fetch(url, {
         credentials: 'same-origin',
         ...fetchInit,
+        headers,
         signal: controller.signal,
       });
       rawText = await res.text();
@@ -79,6 +89,9 @@ export async function safeFetchJson<T>(url: string, options: SafeFetchOptions = 
       parsed = rawText ? JSON.parse(rawText) : {};
     } catch {
       onRetryStatus?.(null);
+      if (res.status === 401) {
+        throw new Error('Your session has expired. Please sign in again.');
+      }
       if (res.status === 403) {
         throw new Error(
           'Session authorization expired or blocked by preview proxy (HTTP 403). Please reload this page and try again.',

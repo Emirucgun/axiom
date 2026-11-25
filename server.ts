@@ -1,10 +1,18 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import http from 'http';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+import crypto from 'crypto';
 import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import type { Part, GenerateContentResponse } from '@google/genai';
+import { createClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from './src/lib/database.types';
+
+// .env.local (shared with Vite) takes precedence over .env
+dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,11 +21,10 @@ const PORT = Number(process.env.PORT) || 3000;
 const MODEL_ID = 'gemini-4-hydrogen';
 const FAST_MODEL_ID = 'gemini-3.1-flash-lite';
 
-function createAiClient() {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
-  }
+const NO_GEMINI_KEY_MESSAGE =
+  'No Gemini API key configured. Add your own key under "API Key" in the header to use AI features.';
+
+function createAiClient(apiKey: string) {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
@@ -118,11 +125,12 @@ function formatApiError(err: unknown): { status: number; message: string } {
     // keep raw string
   }
 
-  if (raw.includes('GEMINI_API_KEY is not configured')) {
-    return {
-      status: 500,
-      message: 'Gemini API key is missing. Please configure GEMINI_API_KEY in Settings > Secrets.',
-    };
+  if (raw.includes(NO_GEMINI_KEY_MESSAGE)) {
+    // 400 (not 401/403) so the client shows the message instead of a re-login prompt
+    return { status: 400, message: NO_GEMINI_KEY_MESSAGE };
+  }
+  if (raw.includes('BYOK_ENCRYPTION_KEY')) {
+    return { status: 500, message: extractedMessage };
   }
   if (raw.includes('PERMISSION_DENIED') || raw.includes('API_KEY_INVALID') || raw.includes('403')) {
     // Return 400 (not 403) so reverse proxy does not intercept and replace JSON with HTML 403 page
@@ -153,6 +161,178 @@ function formatApiError(err: unknown): { status: number; message: string } {
   return { status: 500, message: extractedMessage || 'Unexpected server error while calling Gemini.' };
 }
 
+// ---------------------------------------------------------------------------
+// Supabase auth: every /api route (except /api/health) requires a valid user JWT
+// so public deployments can't burn the server-side GEMINI_API_KEY anonymously.
+// ---------------------------------------------------------------------------
+
+type UserSupabase = SupabaseClient<Database>;
+
+function getSupabaseConfig(): { url: string; anonKey: string } | null {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const anonKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+  return url && anonKey ? { url, anonKey } : null;
+}
+
+/** A Supabase client acting AS the caller, so Postgres RLS + Storage policies apply. */
+function createUserSupabase(accessToken: string): UserSupabase {
+  const config = getSupabaseConfig();
+  if (!config) {
+    throw new Error('Server is missing SUPABASE_URL / SUPABASE_ANON_KEY.');
+  }
+  return createClient<Database>(config.url, config.anonKey, {
+    global: { headers: { Authorization: `Bearer ${accessToken}` } },
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+}
+
+async function requireSupabaseUser(req: Request, res: Response, next: NextFunction) {
+  const header = req.headers.authorization ?? '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  if (!token) {
+    res.status(401).json({ error: 'Sign in required.' });
+    return;
+  }
+  if (!getSupabaseConfig()) {
+    res.status(500).json({ error: 'Server is missing SUPABASE_URL / SUPABASE_ANON_KEY.' });
+    return;
+  }
+  try {
+    const supabase = createUserSupabase(token);
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error) {
+      // Only a real 4xx from Supabase Auth means the token is bad. Network or
+      // 5xx failures must not masquerade as "session expired".
+      const status = (error as { status?: number }).status ?? 0;
+      if (status >= 400 && status < 500) {
+        res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+      } else {
+        console.error(`Supabase auth check failed: ${error.message}`);
+        res.status(502).json({ error: 'Could not reach Supabase to verify your session. Please retry.' });
+      }
+      return;
+    }
+    if (!data.user) {
+      res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
+      return;
+    }
+    res.locals.supabase = supabase;
+    res.locals.userId = data.user.id;
+    next();
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Auth check failed.' });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BYOK: per-user Gemini keys, AES-256-GCM encrypted before they reach Postgres
+// ---------------------------------------------------------------------------
+
+function getByokEncryptionKey(): Buffer {
+  const raw = process.env.BYOK_ENCRYPTION_KEY?.trim();
+  if (!raw) {
+    throw new Error('Server is missing BYOK_ENCRYPTION_KEY (32-byte base64). See .env.example.');
+  }
+  const key = /^[0-9a-f]{64}$/i.test(raw) ? Buffer.from(raw, 'hex') : Buffer.from(raw, 'base64');
+  if (key.length !== 32) {
+    throw new Error('BYOK_ENCRYPTION_KEY must decode to exactly 32 bytes (base64 or 64 hex chars).');
+  }
+  return key;
+}
+
+function encryptSecret(plaintext: string, userId: string): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getByokEncryptionKey(), iv);
+  // Bind ciphertext to its owner so a row copied to another user won't decrypt
+  cipher.setAAD(Buffer.from(userId));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return ['v1', iv.toString('base64'), cipher.getAuthTag().toString('base64'), ciphertext.toString('base64')].join(':');
+}
+
+function decryptSecret(payload: string, userId: string): string {
+  const [version, ivB64, tagB64, dataB64] = payload.split(':');
+  if (version !== 'v1' || !ivB64 || !tagB64 || !dataB64) {
+    throw new Error('Stored API key has an unknown format. Please re-enter it.');
+  }
+  const decipher = crypto.createDecipheriv('aes-256-gcm', getByokEncryptionKey(), Buffer.from(ivB64, 'base64'));
+  decipher.setAAD(Buffer.from(userId));
+  decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+  return Buffer.concat([decipher.update(Buffer.from(dataB64, 'base64')), decipher.final()]).toString('utf8');
+}
+
+/** The caller's own Gemini key if saved, else the optional server-wide fallback. */
+async function resolveGeminiKey(res: Response): Promise<{ apiKey: string; source: 'user' | 'server' }> {
+  const supabase = res.locals.supabase as UserSupabase;
+  const userId = res.locals.userId as string;
+  const { data, error } = await supabase
+    .from('user_api_keys')
+    .select('encrypted_key')
+    .eq('user_id', userId)
+    .eq('provider', 'gemini')
+    .maybeSingle();
+  if (error) throw new Error(`Failed to load API key: ${error.message}`);
+  if (data) {
+    try {
+      return { apiKey: decryptSecret(data.encrypted_key, userId), source: 'user' };
+    } catch (err) {
+      throw new Error(
+        err instanceof Error && err.message.includes('BYOK_ENCRYPTION_KEY')
+          ? err.message
+          : 'Your saved API key could not be decrypted. Please re-enter it under "API Key".',
+      );
+    }
+  }
+  const fallback = process.env.GEMINI_API_KEY?.trim();
+  if (fallback) return { apiKey: fallback, source: 'server' };
+  throw new Error(NO_GEMINI_KEY_MESSAGE);
+}
+
+async function getAiClient(res: Response): Promise<GoogleGenAI> {
+  const { apiKey } = await resolveGeminiKey(res);
+  return createAiClient(apiKey);
+}
+
+/** Gemini file handles are scoped to the key's project — drop them when the key changes. */
+async function clearGeminiFileHandles(supabase: UserSupabase, userId: string): Promise<void> {
+  const { error } = await supabase
+    .from('course_pdfs')
+    .update({ gemini_file_uri: null, gemini_file_expires_at: null })
+    .eq('user_id', userId);
+  if (error) console.warn(`Failed to clear Gemini file handles: ${error.message}`);
+}
+
+function keyHint(apiKey: string): string {
+  return apiKey.slice(-4);
+}
+
+async function uploadPdfToGemini(
+  ai: GoogleGenAI,
+  blob: Blob,
+  displayName: string,
+): Promise<{ fileUri: string; mimeType: string; expirationTime?: string }> {
+  let uploaded = await withRetry(() =>
+    ai.files.upload({
+      file: blob,
+      config: { mimeType: 'application/pdf', displayName },
+    }),
+  );
+
+  let attempts = 0;
+  while (uploaded.state === 'PROCESSING' && uploaded.name && attempts < 15) {
+    await new Promise((r) => setTimeout(r, 800));
+    uploaded = await ai.files.get({ name: uploaded.name });
+    attempts++;
+  }
+  if (uploaded.state === 'FAILED' || !uploaded.uri) {
+    throw new Error(`Gemini failed to process PDF "${displayName}".`);
+  }
+  return {
+    fileUri: uploaded.uri,
+    mimeType: uploaded.mimeType || 'application/pdf',
+    expirationTime: uploaded.expirationTime,
+  };
+}
+
 function computeEloDelta(userElo: number, levelNumber: number, score: number, weight = 24): number {
   const levelRating = 950 + levelNumber * 80;
   const expected = 1 / (1 + Math.pow(10, (levelRating - userElo) / 400));
@@ -160,66 +340,162 @@ function computeEloDelta(userElo: number, levelNumber: number, score: number, we
   return Math.round(weight * (actual - expected));
 }
 
-async function startServer() {
+/**
+ * Builds the Express app with every /api route. Shared by:
+ *  - local dev / `node server.ts` (startServer below adds Vite or static files)
+ *  - Vercel, where api/index.ts exports it as a serverless function
+ */
+export function createApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, hasKey: Boolean(process.env.GEMINI_API_KEY) });
+    res.json({ ok: true });
   });
 
-  // 0. Upload individual PDF binary to Gemini Files API
-  app.post(
-    '/api/files/upload',
-    express.raw({ type: 'application/pdf', limit: '30mb' }),
-    async (req, res) => {
-      try {
-        const buffer = req.body as Buffer;
-        if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
-          res.status(400).json({ error: 'Empty PDF binary body.' });
-          return;
-        }
-        const filename =
-          typeof req.query.filename === 'string' && req.query.filename.trim()
-            ? req.query.filename.trim()
-            : 'course-material.pdf';
+  // Everything below requires a signed-in Supabase user
+  app.use('/api', requireSupabaseUser);
 
-        const ai = createAiClient();
-        const blob = new Blob([new Uint8Array(buffer)], { type: 'application/pdf' });
+  // BYOK: status of the caller's Gemini key (never returns the key itself)
+  app.get('/api/byok', async (_req, res) => {
+    try {
+      const supabase = res.locals.supabase as UserSupabase;
+      const { data, error } = await supabase
+        .from('user_api_keys')
+        .select('key_hint, updated_at')
+        .eq('provider', 'gemini')
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      res.json({
+        provider: 'gemini',
+        hasKey: Boolean(data),
+        keyHint: data?.key_hint ?? null,
+        updatedAt: data?.updated_at ?? null,
+        serverFallbackAvailable: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load API key status.' });
+    }
+  });
 
-        let uploaded = await withRetry(() =>
-          ai.files.upload({
-            file: blob,
-            config: {
-              mimeType: 'application/pdf',
-              displayName: filename,
-            },
-          }),
-        );
-
-        let attempts = 0;
-        while (uploaded.state === 'PROCESSING' && uploaded.name && attempts < 15) {
-          await new Promise((r) => setTimeout(r, 800));
-          uploaded = await ai.files.get({ name: uploaded.name });
-          attempts++;
-        }
-
-        if (uploaded.state === 'FAILED') {
-          throw new Error(`Gemini failed to process PDF "${filename}".`);
-        }
-
-        res.json({
-          fileUri: uploaded.uri,
-          fileName: uploaded.name,
-          mimeType: uploaded.mimeType || 'application/pdf',
-          expirationTime: uploaded.expirationTime,
-        });
-      } catch (err) {
-        const formatted = formatApiError(err);
-        res.status(formatted.status).json({ error: formatted.message });
+  // BYOK: validate with Gemini, encrypt, and store the caller's key
+  app.put('/api/byok', async (req, res) => {
+    try {
+      const apiKey = typeof req.body?.apiKey === 'string' ? req.body.apiKey.trim() : '';
+      if (apiKey.length < 20 || apiKey.length > 200 || /\s/.test(apiKey)) {
+        res.status(400).json({ error: 'That does not look like a valid Gemini API key.' });
+        return;
       }
-    },
-  );
+      const encrypted = encryptSecret(apiKey, res.locals.userId as string); // fails fast if server lacks BYOK_ENCRYPTION_KEY
+
+      try {
+        await createAiClient(apiKey).models.list({ config: { pageSize: 1 } });
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        const rejected = /API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED|40[013]/.test(detail);
+        res.status(400).json({
+          error: rejected
+            ? 'Gemini rejected this API key. Check it at aistudio.google.com/apikey and try again.'
+            : `Could not verify the key with Gemini right now: ${formatApiError(err).message}`,
+        });
+        return;
+      }
+
+      const supabase = res.locals.supabase as UserSupabase;
+      const userId = res.locals.userId as string;
+      const { error } = await supabase
+        .from('user_api_keys')
+        .upsert(
+          { user_id: userId, provider: 'gemini', encrypted_key: encrypted, key_hint: keyHint(apiKey) },
+          { onConflict: 'user_id,provider' },
+        );
+      if (error) throw new Error(error.message);
+      await clearGeminiFileHandles(supabase, userId);
+
+      res.json({ provider: 'gemini', hasKey: true, keyHint: keyHint(apiKey) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to save API key.' });
+    }
+  });
+
+  // BYOK: remove the caller's key
+  app.delete('/api/byok', async (_req, res) => {
+    try {
+      const supabase = res.locals.supabase as UserSupabase;
+      const userId = res.locals.userId as string;
+      const { error } = await supabase.from('user_api_keys').delete().eq('provider', 'gemini');
+      if (error) throw new Error(error.message);
+      await clearGeminiFileHandles(supabase, userId);
+      res.json({ provider: 'gemini', hasKey: false, keyHint: null });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to remove API key.' });
+    }
+  });
+
+  // 0. Hand a course PDF from Supabase Storage to the Gemini Files API.
+  //    The download runs under the caller's JWT, so RLS guarantees users can
+  //    only ever resolve their own PDFs. The resulting URI is cached on the row.
+  app.post('/api/files/from-storage', async (req, res) => {
+    try {
+      const { pdfId, force } = req.body as { pdfId?: string; force?: boolean };
+      if (!pdfId || typeof pdfId !== 'string') {
+        res.status(400).json({ error: 'pdfId is required.' });
+        return;
+      }
+      const supabase = res.locals.supabase as UserSupabase;
+
+      const { data: row, error: rowError } = await supabase
+        .from('course_pdfs')
+        .select('id, file_name, storage_path, gemini_file_uri, gemini_file_expires_at')
+        .eq('id', pdfId)
+        .maybeSingle();
+      if (rowError) throw new Error(rowError.message);
+      if (!row) {
+        res.status(404).json({ error: 'PDF not found.' });
+        return;
+      }
+
+      const fiveMinutesFromNow = Date.now() + 5 * 60 * 1000;
+      const cachedIsFresh =
+        Boolean(row.gemini_file_uri) &&
+        (!row.gemini_file_expires_at || new Date(row.gemini_file_expires_at).getTime() > fiveMinutesFromNow);
+      if (!force && cachedIsFresh && row.gemini_file_uri) {
+        res.json({
+          fileUri: row.gemini_file_uri,
+          mimeType: 'application/pdf',
+          expirationTime: row.gemini_file_expires_at ?? undefined,
+        });
+        return;
+      }
+
+      const { data: blob, error: downloadError } = await supabase.storage
+        .from('course-materials')
+        .download(row.storage_path);
+      if (downloadError || !blob) {
+        throw new Error(`Could not read "${row.file_name}" from storage: ${downloadError?.message ?? 'empty file'}`);
+      }
+
+      const ai = await getAiClient(res);
+      const pdfBlob = blob.type === 'application/pdf' ? blob : new Blob([await blob.arrayBuffer()], { type: 'application/pdf' });
+      const uploaded = await uploadPdfToGemini(ai, pdfBlob, row.file_name);
+
+      const { error: updateError } = await supabase
+        .from('course_pdfs')
+        .update({
+          gemini_file_uri: uploaded.fileUri,
+          gemini_file_expires_at: uploaded.expirationTime ?? null,
+        })
+        .eq('id', row.id);
+      if (updateError) {
+        console.warn(`Failed to cache Gemini URI for ${row.id}: ${updateError.message}`);
+      }
+
+      res.json(uploaded);
+    } catch (err) {
+      const formatted = formatApiError(err);
+      res.status(formatted.status).json({ error: formatted.message });
+    }
+  });
 
   // 1A. Step 1 of Two-Step Chunked Ingestion: Extract compact Topic & Formula Syllabus from a small batch (up to 5 PDFs)
   app.post('/api/roadmap/extract-batch', async (req, res) => {
@@ -237,7 +513,7 @@ async function startServer() {
         return;
       }
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs);
 
       const promptPart: Part = {
@@ -318,7 +594,7 @@ Extract a concise, high-density Topic & Formula Syllabus (300–500 words) cover
         return;
       }
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const useSyllabusOnly = Boolean(combinedSyllabus && combinedSyllabus.trim().length > 0);
 
       if (!useSyllabusOnly && (!Array.isArray(pdfs) || pdfs.length === 0)) {
@@ -482,7 +758,7 @@ Rules:
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
       const compactDigest = (courseDigest || '').slice(0, 2200);
 
@@ -595,7 +871,7 @@ Rules:
         return;
       }
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const recentHistory = (history ?? [])
@@ -664,7 +940,7 @@ Give a clear, direct, intuition-first answer (3–6 sentences or concise bullet 
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
       const compactDigest = (courseDigest || '').slice(0, 2200);
 
@@ -779,7 +1055,7 @@ Formatting rules:
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const promptPart: Part = {
@@ -869,7 +1145,7 @@ Grade this solution carefully:
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const promptPart: Part = {
@@ -947,7 +1223,7 @@ Write everything in ${detectedLanguage || 'English'}. Use KaTeX $...$ and $$...$
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const promptPart: Part = {
@@ -1064,7 +1340,7 @@ Respond in the language of the student's input or ${detectedLanguage || 'English
         pdfs?: IncomingPdf[];
       };
 
-      const ai = createAiClient();
+      const ai = await getAiClient(res);
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const userTurns = history.filter((m) => m.role === 'user').length;
@@ -1188,6 +1464,11 @@ Instructions:
     },
   );
 
+  return app;
+}
+
+async function startServer() {
+  const app = createApp();
   const httpServer = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {
@@ -1214,4 +1495,9 @@ Instructions:
   });
 }
 
-startServer();
+// Only listen when run directly (tsx server.ts / node server.ts), never when
+// imported by the Vercel function in api/index.ts.
+const isDirectRun = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isDirectRun) {
+  startServer();
+}

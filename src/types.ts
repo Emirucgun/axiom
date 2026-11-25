@@ -5,6 +5,8 @@ export type DocCategory = 'lecture_notes' | 'slides' | 'past_exam' | 'problem_se
 export interface PdfAttachmentMeta {
   id: string;
   name: string;
+  /** Object key inside the `course-materials` bucket: {user_id}/{course_id}/{file} */
+  storagePath: string;
   size: number;
   uploadedAt: string;
   docCategory: DocCategory;
@@ -50,6 +52,8 @@ export interface LessonDoubtMessage {
 }
 
 export interface SkillLevel {
+  /** `levels.id` row uuid in Supabase */
+  id: string;
   levelNumber: number;
   title: string;
   tier: LevelTier;
@@ -142,15 +146,12 @@ export interface SessionRecord {
   summary: string;
 }
 
-export interface AppState {
-  version: 1;
+export interface UserProfile {
+  id: string;
+  email: string | null;
   elo: number;
   streakDays: number;
   lastStudyDate: string | null;
-  studyDates: string[];
-  courses: Course[];
-  activeCourseId: string | null;
-  sessions: SessionRecord[];
 }
 
 export type StudyMode = 'climb' | 'reflex' | 'feynman';

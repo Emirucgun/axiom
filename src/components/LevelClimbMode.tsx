@@ -16,12 +16,12 @@ import type {
   Course,
   SkillLevel,
 } from '../types';
-import { withTargetedPdfRetry } from '../utils/pdfStorage';
 import { safeFetchJson } from '../utils/apiClient';
 import {
-  getCachedClimbQuestions,
-  saveCachedClimbQuestions,
-} from '../utils/levelCache';
+  getLevelCache,
+  saveLevelQuestions,
+  withLevelPdfContext,
+} from '../services/courseService';
 import { MathText } from './MathText';
 import { MathHelperBar } from './MathHelperBar';
 
@@ -47,9 +47,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
   onApplySingleElo,
   onNotifyError,
 }) => {
-  const [questions, setQuestions] = useState<ClimbQuestion[]>(
-    () => getCachedClimbQuestions(course.id, level.levelNumber) ?? [],
-  );
+  const [questions, setQuestions] = useState<ClimbQuestion[]>([]);
   const [currentIdx, setCurrentIdx] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [results, setResults] = useState<Record<number, ClimbGradeResult>>({});
@@ -70,19 +68,30 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
   }, []);
 
   useEffect(() => {
-    const cached = getCachedClimbQuestions(course.id, level.levelNumber) ?? [];
-    setQuestions(cached);
+    setQuestions([]);
     setCurrentIdx(0);
     setAnswers({});
     setResults({});
     setShowHint(false);
     setCompleted(false);
     setErrorMsg(null);
-  }, [course.id, level.levelNumber]);
+    // Show previously generated questions (from any device) without spending Gemini quota
+    let cancelled = false;
+    getLevelCache(level.id)
+      .then((cache) => {
+        if (!cancelled && mountedRef.current && cache.questions) setQuestions(cache.questions);
+      })
+      .catch(() => {
+        // Non-fatal: the user can still generate a fresh set
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [course.id, level.id]);
 
   const generateQuestions = async (forceRefresh = false) => {
     if (!forceRefresh) {
-      const cached = getCachedClimbQuestions(course.id, level.levelNumber);
+      const cached = (await getLevelCache(level.id).catch(() => null))?.questions;
       if (cached && cached.length > 0) {
         setQuestions(cached);
         setResults({});
@@ -104,7 +113,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
     setShowHint(false);
 
     try {
-      const data = await withTargetedPdfRetry(
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>
@@ -129,7 +138,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
       const nextQs = data.questions || [];
       setQuestions(nextQs);
       if (nextQs.length > 0) {
-        saveCachedClimbQuestions(course.id, level.levelNumber, nextQs);
+        await saveLevelQuestions(level.id, nextQs);
       }
     } catch (err) {
       if (!mountedRef.current) return;
@@ -180,7 +189,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
     setErrorMsg(null);
     setRetryStatus(null);
     try {
-      const data = await withTargetedPdfRetry(
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>

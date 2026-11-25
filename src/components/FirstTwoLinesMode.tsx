@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Timer, Zap, CheckCircle2, AlertTriangle, XCircle, Loader2, RotateCcw, Clock } from 'lucide-react';
 import type { Course, ReflexEvaluation, ReflexProblem, SkillLevel } from '../types';
-import { withTargetedPdfRetry } from '../utils/pdfStorage';
+import { withLevelPdfContext } from '../services/courseService';
 import { safeFetchJson } from '../utils/apiClient';
 import { MathText } from './MathText';
 import { MathHelperBar } from './MathHelperBar';
@@ -62,7 +62,7 @@ export const FirstTwoLinesMode: React.FC<FirstTwoLinesModeProps> = ({
     setTimerActive(false);
 
     try {
-      const data = await withTargetedPdfRetry(
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>
@@ -102,7 +102,7 @@ export const FirstTwoLinesMode: React.FC<FirstTwoLinesModeProps> = ({
     const elapsed = TOTAL_SECONDS - secondsLeft;
 
     try {
-      const data = await withTargetedPdfRetry(
+      const data = await withLevelPdfContext(
         course,
         level,
         (pdfs) =>

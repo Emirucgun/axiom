@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import type { Session } from '@supabase/supabase-js';
 import {
   Plus,
   Download,
-  Upload,
   Sun,
   Moon,
   BookOpen,
@@ -14,25 +14,44 @@ import {
   Menu,
   X,
   ArrowUpRight,
+  Flame,
+  LogOut,
+  Loader2,
+  TrendingUp,
+  KeyRound,
 } from 'lucide-react';
 import type {
-  AppState,
   Course,
   ReflexEvaluation,
   SessionRecord,
   StudyMode,
+  UserProfile,
 } from './types';
 import {
-  loadAppState,
-  saveAppState,
   loadThemePreference,
   saveThemePreference,
-  recordDailyActivity,
-  validateImportedState,
   computeCourseReadiness,
 } from './utils/persistence';
-import { deleteCoursePdfsFromDb } from './utils/pdfStorage';
-import { clearCourseLevelCache } from './utils/levelCache';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
+import {
+  clearGeminiUriCache,
+  createCourse,
+  deleteCourse,
+  fetchCourse,
+  listCourses,
+} from './services/courseService';
+import type { ApiKeyStatus } from './services/apiKeyService';
+import { getApiKeyStatus, isAiAvailable } from './services/apiKeyService';
+import { ApiKeySettings } from './components/ApiKeySettings';
+import {
+  applyEloDelta,
+  buildExportBackup,
+  getProfile,
+  listStudySessions,
+  PASS_THRESHOLD,
+  recordStudyAttempt,
+} from './services/studyService';
+import { AuthGate, SupabaseSetupRequired } from './components/AuthGate';
 import { TelemetryStrip } from './components/TelemetryStrip';
 import { CourseMaterialPanel } from './components/CourseMaterialPanel';
 import { SkillTree } from './components/SkillTree';
@@ -45,9 +64,58 @@ import { MathText } from './components/MathText';
 
 type WorkspaceView = 'tree' | 'studio' | 'history';
 
-export default function App() {
-  const [state, setState] = useState<AppState>(() => loadAppState());
+function FullScreenSpinner({ label }: { label: string }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center gap-2.5 bg-slate-50 dark:bg-[#0B0F17] text-sm text-slate-500 dark:text-slate-400">
+      <Loader2 className="w-4 h-4 animate-spin text-sky-600 dark:text-sky-400" />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function useThemeSync(): ['light' | 'dark', React.Dispatch<React.SetStateAction<'light' | 'dark'>>] {
   const [theme, setTheme] = useState<'light' | 'dark'>(() => loadThemePreference());
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    saveThemePreference(theme);
+  }, [theme]);
+  return [theme, setTheme];
+}
+
+export default function App() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  // Apply the saved theme on the auth screens too
+  useThemeSync();
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, next) => {
+      setSession(next);
+      setAuthReady(true);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  if (!isSupabaseConfigured) return <SupabaseSetupRequired />;
+  if (!authReady) return <FullScreenSpinner label="Loading…" />;
+  if (!session) return <AuthGate />;
+  // Keyed by user id so switching accounts fully resets workspace state
+  return <Workspace key={session.user.id} />;
+}
+
+function Workspace() {
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [activeCourseId, setActiveCourseId] = useState<string | null>(null);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [theme, setTheme] = useThemeSync();
   const [activeView, setActiveView] = useState<WorkspaceView>('tree');
   const [selectedLevelNum, setSelectedLevelNum] = useState<number>(1);
   const [levelStep, setLevelStep] = useState<'learn' | 'test'>('learn');
@@ -56,36 +124,59 @@ export default function App() {
   const [newCourseOpen, setNewCourseOpen] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [confirmDeleteCourseId, setConfirmDeleteCourseId] = useState<string | null>(null);
+  const [deletingCourseId, setDeletingCourseId] = useState<string | null>(null);
+  const [apiKeyStatus, setApiKeyStatus] = useState<ApiKeyStatus | null>(null);
+  const [apiKeyOpen, setApiKeyOpen] = useState(false);
   const [bannerMessage, setBannerMessage] = useState<{
     type: 'success' | 'error';
     text: string;
   } | null>(null);
 
-  const importInputRef = useRef<HTMLInputElement | null>(null);
-
-  // Warm up backend server on mount/focus after idle scale-to-zero
+  // Warm up backend server on mount after idle scale-to-zero
   useEffect(() => {
     fetch('/api/health').catch(() => {});
   }, []);
 
-  // Sync theme class on <html>
-  useEffect(() => {
-    const root = document.documentElement;
-    if (theme === 'dark') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
+  // Initial load of everything the signed-in user owns
+  const loadWorkspace = useCallback(async () => {
+    setDataLoading(true);
+    setLoadError(null);
+    try {
+      const [nextProfile, nextCourses] = await Promise.all([getProfile(), listCourses()]);
+      const nextSessions = await listStudySessions(nextCourses);
+      setProfile(nextProfile);
+      setCourses(nextCourses);
+      setSessions(nextSessions);
+      setActiveCourseId((prev) => prev ?? nextCourses[0]?.id ?? null);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : 'Failed to load your workspace.');
+    } finally {
+      setDataLoading(false);
     }
-    saveThemePreference(theme);
-  }, [theme]);
+  }, []);
 
-  // Persist AppState to localStorage
   useEffect(() => {
-    saveAppState(state);
-  }, [state]);
+    loadWorkspace();
+    // BYOK status is non-blocking: the workspace works without it
+    getApiKeyStatus()
+      .then(setApiKeyStatus)
+      .catch(() => setApiKeyStatus(null));
+  }, [loadWorkspace]);
+
+  const handleApiKeyChanged = async (next: ApiKeyStatus) => {
+    setApiKeyStatus(next);
+    // The server cleared cached Gemini file handles (they're tied to the key);
+    // drop ours too and reload PDF metadata so nothing stale is reused.
+    clearGeminiUriCache();
+    try {
+      setCourses(await listCourses());
+    } catch {
+      // Non-fatal: stale handles are also refreshed on first use
+    }
+  };
 
   const activeCourse =
-    state.courses.find((c) => c.id === state.activeCourseId) ?? state.courses[0] ?? null;
+    courses.find((c) => c.id === activeCourseId) ?? courses[0] ?? null;
 
   // Auto-collapse materials panel if roadmap exists and user switches courses
   useEffect(() => {
@@ -110,253 +201,207 @@ export default function App() {
     }, duration);
   };
 
-  const handleCreateCourse = (course: Course) => {
-    setState((prev) => ({
-      ...prev,
-      courses: [...prev.courses, course],
-      activeCourseId: course.id,
-    }));
+  const replaceCourse = (updated: Course) => {
+    setCourses((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+  };
+
+  const handleCreateCourse = async (input: { name: string; code: string; examDate?: string }) => {
+    const course = await createCourse(input);
+    setCourses((prev) => [...prev, course]);
+    setActiveCourseId(course.id);
     setActiveView('tree');
     setShowMaterials(true);
     setMobileSidebarOpen(false);
   };
 
   const handleUpdateCourse = (updated: Course) => {
-    setState((prev) => ({
-      ...prev,
-      courses: prev.courses.map((c) => (c.id === updated.id ? updated : c)),
-    }));
-    if (updated.levels.length > 0 && showMaterials && prevHadNoLevels(updated.id)) {
+    const hadNoLevels = (courses.find((c) => c.id === updated.id)?.levels.length ?? 0) === 0;
+    replaceCourse(updated);
+    if (updated.levels.length > 0 && showMaterials && hadNoLevels) {
       setShowMaterials(false);
     }
   };
 
-  const prevHadNoLevels = (courseId: string) => {
-    const existing = state.courses.find((c) => c.id === courseId);
-    return existing ? existing.levels.length === 0 : false;
-  };
-
   const handleDeleteCourse = async (courseId: string) => {
-    await deleteCoursePdfsFromDb(courseId);
-    clearCourseLevelCache(courseId);
-    setState((prev) => {
-      const remaining = prev.courses.filter((c) => c.id !== courseId);
-      const nextActive =
-        prev.activeCourseId === courseId ? (remaining[0]?.id ?? null) : prev.activeCourseId;
-      return {
-        ...prev,
-        courses: remaining,
-        activeCourseId: nextActive,
-      };
-    });
-    setConfirmDeleteCourseId(null);
+    setDeletingCourseId(courseId);
+    try {
+      await deleteCourse(courseId);
+      const remaining = courses.filter((c) => c.id !== courseId);
+      setCourses(remaining);
+      setSessions((prev) => prev.filter((s) => s.courseId !== courseId));
+      if (activeCourseId === courseId) {
+        setActiveCourseId(remaining[0]?.id ?? null);
+      }
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to delete course.');
+    } finally {
+      setDeletingCourseId(null);
+      setConfirmDeleteCourseId(null);
+    }
   };
 
-  const handleApplySingleElo = (delta: number) => {
-    setState((prev) => ({
-      ...prev,
-      elo: Math.max(600, prev.elo + delta),
-    }));
+  /** Re-reads the course's levels (unlocks, best scores) and the session log from Supabase. */
+  const refreshAfterAttempt = async (courseId: string) => {
+    const updated = await fetchCourse(courseId);
+    const nextCourses = courses.map((c) => (c.id === courseId ? updated : c));
+    setCourses(nextCourses);
+    setSessions(await listStudySessions(nextCourses));
   };
 
-  const handleCompleteClimb = (
+  const findLevelId = (levelNumber: number): string | null =>
+    activeCourse?.levels.find((l) => l.levelNumber === levelNumber)?.id ?? null;
+
+  const handleApplySingleElo = async (delta: number) => {
+    // Optimistic update, then reconcile with the server value
+    setProfile((p) => (p ? { ...p, elo: Math.max(600, p.elo + delta) } : p));
+    try {
+      const elo = await applyEloDelta(delta);
+      setProfile((p) => (p ? { ...p, elo } : p));
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to save Elo change.');
+    }
+  };
+
+  const handleCompleteClimb = async (
     levelNumber: number,
     averageScore: number,
     totalEloDelta: number,
     summaryText: string,
   ) => {
-    if (!activeCourse) return;
-    const passed = averageScore >= 80;
+    const levelId = findLevelId(levelNumber);
+    if (!activeCourse || !levelId) return;
 
-    setState((prev) => {
-      const streakUpdate = recordDailyActivity(prev);
-      const updatedCourses = prev.courses.map((c) => {
-        if (c.id !== activeCourse.id) return c;
-        const nextLevels = c.levels.map((lvl) => {
-          if (lvl.levelNumber === levelNumber) {
-            const best =
-              lvl.bestScore === null ? averageScore : Math.max(lvl.bestScore, averageScore);
-            return {
-              ...lvl,
-              bestScore: best,
-              mastered: lvl.mastered || passed,
-              attempts: lvl.attempts + 1,
-            };
-          }
-          if (passed && lvl.levelNumber === levelNumber + 1) {
-            return { ...lvl, unlocked: true };
-          }
-          return lvl;
-        });
-        return { ...c, levels: nextLevels };
-      });
-
-      const targetLvl = activeCourse.levels.find((l) => l.levelNumber === levelNumber);
-      const session: SessionRecord = {
-        id: `sess_${Date.now()}`,
-        courseId: activeCourse.id,
-        courseName: activeCourse.name,
-        levelNumber,
-        levelTitle: targetLvl?.title ?? `Level ${levelNumber}`,
+    try {
+      const result = await recordStudyAttempt({
+        levelId,
         mode: 'climb',
         score: averageScore,
         eloDelta: totalEloDelta,
-        timestamp: new Date().toISOString(),
         summary: summaryText,
-      };
+        // Elo was already applied per graded question
+        applyElo: false,
+      });
+      setProfile((p) => (p ? { ...p, elo: result.elo, streakDays: result.streakDays, lastStudyDate: result.lastStudyDate } : p));
+      await refreshAfterAttempt(activeCourse.id);
 
-      return {
-        ...prev,
-        ...streakUpdate,
-        courses: updatedCourses,
-        sessions: [session, ...prev.sessions].slice(0, 100),
-      };
-    });
-
-    if (passed) {
-      showToast(
-        'success',
-        levelNumber < 10
-          ? `Level ${levelNumber} mastered (${averageScore}%). Level ${levelNumber + 1} unlocked!`
-          : `Level 10 mastered (${averageScore}%)! Distinction tier complete.`,
-      );
+      if (result.passed) {
+        showToast(
+          'success',
+          levelNumber < 10
+            ? `Level ${levelNumber} mastered (${averageScore}%). Level ${levelNumber + 1} unlocked!`
+            : `Level 10 mastered (${averageScore}%)! Distinction tier complete.`,
+        );
+      } else if (averageScore < PASS_THRESHOLD) {
+        showToast('error', `Scored ${averageScore}% — reach ${PASS_THRESHOLD}% to unlock the next level.`);
+      }
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to save Level Climb result.');
     }
   };
 
-  const handleCompleteReflex = (
+  const handleCompleteReflex = async (
     levelNumber: number,
     evaluation: ReflexEvaluation,
     elapsedSeconds: number,
   ) => {
-    if (!activeCourse) return;
+    const levelId = findLevelId(levelNumber);
+    if (!activeCourse || !levelId) return;
 
-    setState((prev) => {
-      const streakUpdate = recordDailyActivity(prev);
-      const updatedCourses = prev.courses.map((c) => {
-        if (c.id !== activeCourse.id) return c;
-        return {
-          ...c,
-          levels: c.levels.map((lvl) =>
-            lvl.levelNumber === levelNumber && evaluation.verdict === 'valid'
-              ? { ...lvl, reflexPassed: lvl.reflexPassed + 1 }
-              : lvl,
-          ),
-        };
-      });
-
-      const targetLvl = activeCourse.levels.find((l) => l.levelNumber === levelNumber);
-      const session: SessionRecord = {
-        id: `sess_${Date.now()}`,
-        courseId: activeCourse.id,
-        courseName: activeCourse.name,
-        levelNumber,
-        levelTitle: targetLvl?.title ?? `Level ${levelNumber}`,
+    try {
+      const result = await recordStudyAttempt({
+        levelId,
         mode: 'reflex',
         score: evaluation.score,
         eloDelta: evaluation.eloDelta,
-        timestamp: new Date().toISOString(),
+        passed: evaluation.verdict === 'valid',
         summary: `First 2 Lines in ${elapsedSeconds}s (${evaluation.verdict})`,
-      };
-
-      return {
-        ...prev,
-        ...streakUpdate,
-        elo: Math.max(600, prev.elo + evaluation.eloDelta),
-        courses: updatedCourses,
-        sessions: [session, ...prev.sessions].slice(0, 100),
-      };
-    });
+      });
+      setProfile((p) => (p ? { ...p, elo: result.elo, streakDays: result.streakDays, lastStudyDate: result.lastStudyDate } : p));
+      await refreshAfterAttempt(activeCourse.id);
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to save First 2 Lines result.');
+    }
   };
 
-  const handleCompleteFeynman = (
+  const handleCompleteFeynman = async (
     levelNumber: number,
     clarityScore: number,
     eloDelta: number,
   ) => {
-    if (!activeCourse) return;
+    const levelId = findLevelId(levelNumber);
+    if (!activeCourse || !levelId) return;
 
-    setState((prev) => {
-      const streakUpdate = recordDailyActivity(prev);
-      const updatedCourses = prev.courses.map((c) => {
-        if (c.id !== activeCourse.id) return c;
-        return {
-          ...c,
-          levels: c.levels.map((lvl) => {
-            if (lvl.levelNumber !== levelNumber) return lvl;
-            const best =
-              lvl.feynmanBestClarity === null
-                ? clarityScore
-                : Math.max(lvl.feynmanBestClarity, clarityScore);
-            return { ...lvl, feynmanBestClarity: best };
-          }),
-        };
-      });
-
-      const targetLvl = activeCourse.levels.find((l) => l.levelNumber === levelNumber);
-      const session: SessionRecord = {
-        id: `sess_${Date.now()}`,
-        courseId: activeCourse.id,
-        courseName: activeCourse.name,
-        levelNumber,
-        levelTitle: targetLvl?.title ?? `Level ${levelNumber}`,
+    try {
+      const result = await recordStudyAttempt({
+        levelId,
         mode: 'feynman',
         score: clarityScore,
         eloDelta,
-        timestamp: new Date().toISOString(),
         summary: `Feynman Clarity Score: ${clarityScore}%`,
-      };
-
-      return {
-        ...prev,
-        ...streakUpdate,
-        elo: Math.max(600, prev.elo + eloDelta),
-        courses: updatedCourses,
-        sessions: [session, ...prev.sessions].slice(0, 100),
-      };
-    });
+      });
+      setProfile((p) => (p ? { ...p, elo: result.elo, streakDays: result.streakDays, lastStudyDate: result.lastStudyDate } : p));
+      await refreshAfterAttempt(activeCourse.id);
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Failed to save Feynman result.');
+    }
   };
 
-  const handleExportJson = () => {
-    const payload = JSON.stringify(state, null, 2);
-    const blob = new Blob([payload], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `axiom-mastery-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showToast('success', 'Progress backup exported as JSON.');
+  const handleExportJson = async () => {
+    try {
+      const backup = await buildExportBackup();
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `axiom-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast('success', 'Progress backup exported as JSON.');
+    } catch (err) {
+      showToast('error', err instanceof Error ? err.message : 'Export failed.');
+    }
   };
 
-  const handleImportJson = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const parsed = JSON.parse(String(reader.result));
-        const validated = validateImportedState(parsed);
-        if (!validated) {
-          throw new Error('Invalid Axiom progress JSON structure.');
-        }
-        setState(validated);
-        showToast(
-          'success',
-          `Imported ${validated.courses.length} course(s) and ${validated.sessions.length} session records.`,
-        );
-      } catch (err) {
-        showToast(
-          'error',
-          err instanceof Error ? err.message : 'Failed to parse imported JSON.',
-        );
-      } finally {
-        if (importInputRef.current) {
-          importInputRef.current.value = '';
-        }
-      }
-    };
-    reader.readAsText(file);
+  const handleSignOut = async () => {
+    const { error } = await supabase.auth.signOut();
+    if (error) showToast('error', error.message);
   };
+
+  if (dataLoading && !profile) {
+    return <FullScreenSpinner label="Loading your courses…" />;
+  }
+
+  if (loadError && !profile) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#0B0F17] px-4">
+        <div className="w-full max-w-md rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 space-y-4">
+          <div className="flex items-start gap-2.5 text-sm text-red-700 dark:text-red-300">
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{loadError}</span>
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={loadWorkspace}
+              className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-xs font-medium cursor-pointer"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="px-4 py-2 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 cursor-pointer"
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const elo = profile?.elo ?? 1000;
+  const streakDays = profile?.streakDays ?? 0;
 
   const selectedLevel =
     activeCourse?.levels.find((l) => l.levelNumber === selectedLevelNum) ??
@@ -418,32 +463,51 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Right Header Actions: Export / Import / Theme */}
+        {/* Right Header Actions: Profile / Export / Theme / Sign out */}
         <div className="flex items-center gap-2 shrink-0">
-          <input
-            ref={importInputRef}
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={handleImportJson}
-          />
+          <div
+            className="hidden sm:flex items-center gap-3 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs"
+            title={profile?.email ?? undefined}
+          >
+            <span className="inline-flex items-center gap-1 font-mono tabular-nums font-semibold text-slate-800 dark:text-slate-100">
+              <TrendingUp className="w-3.5 h-3.5 text-sky-600 dark:text-sky-400" />
+              {elo}
+            </span>
+            <span className="inline-flex items-center gap-1 font-mono tabular-nums font-semibold text-slate-800 dark:text-slate-100">
+              <Flame className="w-3.5 h-3.5 text-amber-500" />
+              {streakDays}d
+            </span>
+            <span className="hidden lg:inline max-w-40 truncate text-slate-500 dark:text-slate-400">
+              {profile?.email}
+            </span>
+          </div>
           <button
             type="button"
-            onClick={handleExportJson}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={() => setApiKeyOpen(true)}
+            title="Gemini API key (bring your own key)"
+            className="relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Export Progress (JSON)</span>
-            <span className="sm:hidden">Export</span>
+            <KeyRound className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">API Key</span>
+            <span
+              aria-hidden="true"
+              className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ring-2 ring-white dark:ring-[#0F172A] ${
+                apiKeyStatus?.hasKey
+                  ? 'bg-emerald-500'
+                  : isAiAvailable(apiKeyStatus)
+                    ? 'bg-sky-500'
+                    : 'bg-amber-500'
+              }`}
+            />
           </button>
           <button
             type="button"
-            onClick={() => importInputRef.current?.click()}
+            onClick={handleExportJson}
+            title="Download a JSON backup of your courses and progress"
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            <Upload className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Import Progress (JSON)</span>
-            <span className="sm:hidden">Import</span>
+            <Download className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Export JSON</span>
           </button>
           <button
             type="button"
@@ -452,6 +516,15 @@ export default function App() {
             className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 transition-colors cursor-pointer"
           >
             {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          </button>
+          <button
+            type="button"
+            onClick={handleSignOut}
+            aria-label="Sign out"
+            title="Sign out"
+            className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 transition-colors cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
           </button>
         </div>
       </header>
@@ -479,13 +552,13 @@ export default function App() {
               </button>
             </div>
 
-            {state.courses.length === 0 ? (
+            {courses.length === 0 ? (
               <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed py-2">
                 No courses created yet. Add a course like Calculus II, Algorithms, or Physics to start building your skill tree.
               </p>
             ) : (
               <div className="space-y-1.5">
-                {state.courses.map((course) => {
+                {courses.map((course) => {
                   const isActive = activeCourse?.id === course.id;
                   const mastered = course.levels.filter((l) => l.mastered).length;
                   const readiness = computeCourseReadiness(course);
@@ -503,7 +576,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => {
-                            setState((prev) => ({ ...prev, activeCourseId: course.id }));
+                            setActiveCourseId(course.id);
                             setMobileSidebarOpen(false);
                           }}
                           className="flex-1 text-left min-w-0 cursor-pointer"
@@ -525,10 +598,11 @@ export default function App() {
                           <div className="flex flex-col gap-1 shrink-0">
                             <button
                               type="button"
+                              disabled={deletingCourseId === course.id}
                               onClick={() => handleDeleteCourse(course.id)}
-                              className="px-2 py-0.5 rounded bg-red-600 text-white text-[11px] font-medium cursor-pointer"
+                              className="px-2 py-0.5 rounded bg-red-600 disabled:opacity-60 text-white text-[11px] font-medium cursor-pointer"
                             >
-                              Delete
+                              {deletingCourseId === course.id ? 'Deleting…' : 'Delete'}
                             </button>
                             <button
                               type="button"
@@ -584,6 +658,23 @@ export default function App() {
             ))}
           </div>
 
+          {/* BYOK prompt when no Gemini key is available */}
+          {apiKeyStatus && !isAiAvailable(apiKeyStatus) && (
+            <div className="rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-4 py-3 text-sm text-amber-900 dark:text-amber-100 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <KeyRound className="w-4 h-4 shrink-0" />
+                <span>Add your Gemini API key to generate roadmaps, lessons and graded questions.</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setApiKeyOpen(true)}
+                className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-medium whitespace-nowrap cursor-pointer"
+              >
+                Add API key
+              </button>
+            </div>
+          )}
+
           {/* Toast feedback banner */}
           {bannerMessage && (
             <div
@@ -616,7 +707,7 @@ export default function App() {
           {/* Empty State if no courses exist */}
           {!activeCourse ? (
             <div className="space-y-6">
-              <TelemetryStrip elo={state.elo} streakDays={state.streakDays} activeCourse={null} />
+              <TelemetryStrip elo={elo} streakDays={streakDays} activeCourse={null} />
 
               <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 md:p-10 space-y-6">
                 <div className="max-w-2xl space-y-2.5">
@@ -707,8 +798,8 @@ export default function App() {
 
               {/* Telemetry Strip */}
               <TelemetryStrip
-                elo={state.elo}
-                streakDays={state.streakDays}
+                elo={elo}
+                streakDays={streakDays}
                 activeCourse={activeCourse}
               />
 
@@ -953,7 +1044,7 @@ export default function App() {
                               key={`climb-${activeCourse.id}-${selectedLevel.levelNumber}`}
                               course={activeCourse}
                               level={selectedLevel}
-                              userElo={state.elo}
+                              userElo={elo}
                               onApplySingleElo={handleApplySingleElo}
                               onCompleteClimb={handleCompleteClimb}
                               onNotifyError={(msg) => showToast('error', msg)}
@@ -965,7 +1056,7 @@ export default function App() {
                               key={`reflex-${activeCourse.id}-${selectedLevel.levelNumber}`}
                               course={activeCourse}
                               level={selectedLevel}
-                              userElo={state.elo}
+                              userElo={elo}
                               onCompleteReflex={handleCompleteReflex}
                               onNotifyError={(msg) => showToast('error', msg)}
                             />
@@ -976,7 +1067,7 @@ export default function App() {
                               key={`feynman-${activeCourse.id}-${selectedLevel.levelNumber}`}
                               course={activeCourse}
                               level={selectedLevel}
-                              userElo={state.elo}
+                              userElo={elo}
                               onCompleteFeynman={handleCompleteFeynman}
                               onNotifyError={(msg) => showToast('error', msg)}
                             />
@@ -1001,11 +1092,11 @@ export default function App() {
                       </p>
                     </div>
                     <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
-                      {state.sessions.length} entries
+                      {sessions.length} entries
                     </span>
                   </div>
 
-                  {state.sessions.length === 0 ? (
+                  {sessions.length === 0 ? (
                     <div className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
                       No sessions recorded yet. Complete a drill in the Study Studio to log your progress.
                     </div>
@@ -1024,7 +1115,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                          {state.sessions.map((s) => (
+                          {sessions.map((s) => (
                             <tr
                               key={s.id}
                               className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors"
@@ -1072,6 +1163,13 @@ export default function App() {
           )}
         </main>
       </div>
+
+      <ApiKeySettings
+        open={apiKeyOpen}
+        status={apiKeyStatus}
+        onClose={() => setApiKeyOpen(false)}
+        onChanged={handleApiKeyChanged}
+      />
 
       <NewCourseModal
         open={newCourseOpen}
