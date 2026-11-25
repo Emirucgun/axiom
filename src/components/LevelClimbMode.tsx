@@ -120,7 +120,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
           safeFetchJson<{ questions?: ClimbQuestion[] }>('/api/climb/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            timeoutMs: 45000,
+            timeoutMs: 90000,
             onRetryStatus: (msg) => {
               if (mountedRef.current) setRetryStatus(msg);
             },
@@ -133,6 +133,7 @@ export const LevelClimbMode: React.FC<LevelClimbModeProps> = ({
             }),
           }),
         2,
+        { includeExamReference: true },
       );
       if (!mountedRef.current) return;
       const nextQs = data.questions || [];

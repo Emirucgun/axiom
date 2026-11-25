@@ -69,7 +69,7 @@ export const FirstTwoLinesMode: React.FC<FirstTwoLinesModeProps> = ({
           safeFetchJson<ReflexProblem>('/api/reflex/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            timeoutMs: 45000,
+            timeoutMs: 90000,
             onRetryStatus: (msg) => setRetryStatus(msg),
             body: JSON.stringify({
               courseName: course.name,
@@ -80,6 +80,7 @@ export const FirstTwoLinesMode: React.FC<FirstTwoLinesModeProps> = ({
             }),
           }),
         2,
+        { includeExamReference: true },
       );
       setProblem(data);
       setTimerActive(true);

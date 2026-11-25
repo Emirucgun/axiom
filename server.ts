@@ -21,6 +21,32 @@ const PORT = Number(process.env.PORT) || 3000;
 const MODEL_ID = 'gemini-4-hydrogen';
 const FAST_MODEL_ID = 'gemini-3.1-flash-lite';
 
+// ---------------------------------------------------------------------------
+// Output language policy
+// ---------------------------------------------------------------------------
+// Explanations (lessons, feedback, hints, dialogue) are written in Turkish, but
+// key technical terms stay in English so they match the vocabulary of exams and
+// textbooks. Exam questions/problem statements themselves are written fully in
+// English. The source PDFs can be in any language.
+const EXPLANATION_LANGUAGE = 'Turkish';
+const QUESTION_LANGUAGE = 'English';
+
+const LANGUAGE_POLICY = `LANGUAGE POLICY (mandatory, overrides the language of the source PDFs and of the student's input):
+- Write all explanations, teaching text, hints, feedback, and conversation in ${EXPLANATION_LANGUAGE}.
+- Keep important technical terms, concept names, theorem/law names, and standard jargon in English (e.g. "eigenvalue", "boundary condition", "Laplace transform", "free body diagram", "steady state"). Do NOT translate them into ${EXPLANATION_LANGUAGE}. Use them naturally inside ${EXPLANATION_LANGUAGE} sentences, e.g. "Bu sistemde eigenvalue'lar negatif olduğu için system stable'dır."
+- Write every exam question, problem statement, and question prompt entirely in ${QUESTION_LANGUAGE}, exactly as it would appear on an English-language university exam paper.`;
+
+// Persona + rules shared by every endpoint that writes exam-style questions.
+const EXAM_PROFESSOR_GUIDE = `You are the university professor who teaches this course AND writes its midterm and final exams. Write the questions you would actually put on your own exam.
+
+How you choose and write questions:
+1. Target high-yield, core material: the central theorems, laws, methods, and derivations that the syllabus and lecture notes spend the most time on. A topic that appears in the level objectives or key formulas is exam material; a passing remark is not.
+2. If a past exam, quiz, or problem set is attached (Category: past_exam or problem_set), treat it as the strongest signal: mirror its question formats, difficulty, notation, typical given values, and recurring archetypes. Create NEW variants (different numbers, configurations, or a twist); never copy a question verbatim.
+3. If no past exam is attached, predict what is most likely to be asked from the topic list: use the classic, standard exam archetypes for these topics as they appear in well-known university textbooks and exams (e.g. "derive ...", "compute ... for the given system", "determine whether ... and justify", "sketch/interpret ...", multi-part (a)(b)(c) problems).
+4. Each question must be self-contained and solvable on paper in a realistic exam time: give all needed data with units, define every symbol, and state the assumptions. One unambiguous expected answer or method.
+5. NEVER write irrelevant or low-value questions: no trivia, history, or name-dropping; no questions about the documents themselves ("according to slide 4...", "what does the author say..."); no definitions-only recall unless the level is foundational; nothing outside the course scope; no vague essay questions.
+6. Use the course's own notation and conventions from the attached material.`;
+
 const NO_GEMINI_KEY_MESSAGE =
   'No Gemini API key configured. Add your own key under "API Key" in the header to use AI features.';
 
@@ -60,6 +86,18 @@ interface IncomingPdf {
   fileUri?: string;
   mimeType?: string;
   base64?: string;
+}
+
+function isExamReference(pdf: IncomingPdf): boolean {
+  return pdf?.docCategory === 'past_exam' || pdf?.docCategory === 'problem_set';
+}
+
+/** Tells the model whether real exam material is attached, so it knows how to calibrate. */
+function describeExamReferences(pdfs?: IncomingPdf[]): string {
+  const refs = (Array.isArray(pdfs) ? pdfs : []).filter(isExamReference);
+  return refs.length > 0
+    ? `Exam reference material attached: ${refs.map((p) => `"${p.name}" (${p.docCategory})`).join(', ')}. Model your questions on these.`
+    : 'No past exam is attached: predict the most likely exam questions from the topics, objectives, and key formulas.';
 }
 
 function buildPdfParts(pdfs?: IncomingPdf[], maxCount?: number): Part[] {
@@ -523,7 +561,8 @@ Attached PDFs in this batch: ${pdfs.map((p) => `${p.name} (${p.docCategory || 'l
 Extract a concise, high-density Topic & Formula Syllabus (300–500 words) covering ONLY the material in this batch:
 1. Detect the primary language of these PDFs (e.g., English, Italian, Turkish). Write ALL extracted text in that language.
 2. List the core concepts, theorems, key equations (wrapped in KaTeX $...$), definitions, and exam problem archetypes found in these PDFs.
-3. For each PDF file in this batch, output a "fileTopics" entry with exact fileName, 4–8 short topic keywords, and a 1–2 sentence summary.`,
+3. For any PDF in the past_exam or problem_set category, explicitly record its recurring question types, formats (e.g. multi-part, derive/compute/prove), typical difficulty, and the topics that carry the most points. Keep the key technical terms in English.
+4. For each PDF file in this batch, output a "fileTopics" entry with exact fileName, 4–8 short topic keywords, and a 1–2 sentence summary.`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
@@ -614,14 +653,16 @@ Extract a concise, high-density Topic & Formula Syllabus (300–500 words) cover
 
       const promptPart: Part = {
         text: `Build a sequential 10-Level Mastery Skill Tree for "${courseName}" (${courseCode || 'Engineering Course'}).
-${detectedLanguage ? `Primary Language: ${detectedLanguage}` : 'Detect the primary language of the syllabus and write all fields in that language.'}
+${detectedLanguage ? `Source Material Language: ${detectedLanguage}` : 'Detect the primary language of the source material and report it in "detectedLanguage".'}
+
+${LANGUAGE_POLICY}
 
 ${useSyllabusOnly ? `Extracted Multi-Batch Topic & Formula Syllabus:\n"""\n${combinedSyllabus}\n"""` : 'Analyze the attached PDFs.'}
 ${manifestText}
 
 Task:
-1. Produce "courseDigest": a crisp master syllabus reference (theorems, key formulas, and exam archetypes).
-2. Break the syllabus into strictly 10 progressive levels numbered 1 through 10:
+1. Produce "courseDigest": a crisp master syllabus reference (theorems, key formulas) that ends with a section listing the 6–10 exam question archetypes a professor of this course would most likely put on the midterm/final (based on past exams if present, otherwise on the standard archetypes for these topics).
+2. Break the syllabus into strictly 10 progressive levels numbered 1 through 10, prioritizing the high-yield topics that are most likely to be examined:
    - Levels 1–2 (tier: "foundation"): Foundational definitions, physical/mathematical intuition, and basic conceptual checks.
    - Levels 3–5 (tier: "application"): Standard single-step formula applications and basic problem-solving.
    - Levels 6–8 (tier: "exam"): Exam-level multi-step engineering problems modeled after past exams.
@@ -638,7 +679,7 @@ Rules:
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are an elite university engineering curriculum architect. Produce strictly valid JSON matching the schema with 10 sequential levels.',
+              'You are an elite university engineering professor and curriculum architect who knows exactly what gets asked on exams. Produce strictly valid JSON matching the schema with 10 sequential levels. Follow the language policy in the prompt: explanatory fields in Turkish with key technical terms kept in English.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             responseMimeType: 'application/json',
             responseSchema: {
@@ -764,7 +805,7 @@ Rules:
 
       const promptPart: Part = {
         text: `Course: ${courseName}
-Course Language: ${detectedLanguage || 'English'}
+Source Material Language: ${detectedLanguage || 'English'}
 Compact Syllabus Context: ${compactDigest}
 
 Target Micro-Level: Level ${level.levelNumber} — "${level.title}" (Tier: ${level.tier})
@@ -777,11 +818,13 @@ Create a crisp, intuition-first Mini-Lesson (Konu Anlatımı) covering ONLY the 
 1. "title": Clear lesson title.
 2. "intuition": 2–3 sentences building physical/mathematical intuition ("why this works" before memorizing formulas).
 3. "sections": 2 to 4 focused concept sections, each with a clear "heading", 2–4 concise "bullets", and an optional "keyEquation" in KaTeX display/inline form.
-4. "workedExample": ONE complete, exam-relevant step-by-step solved example ("problemStatement", numbered "steps" array showing clear reasoning + KaTeX equations, "finalAnswer", and "takeaway").
+4. "workedExample": ONE complete step-by-step solved example of the kind most likely to appear on this course's exam for this level ("problemStatement", numbered "steps" array showing clear reasoning + KaTeX equations, "finalAnswer", and "takeaway"). If a past exam is attached, model it on that exam's style.
 5. "commonPitfalls": 2–3 common exam traps or sign/assumption mistakes to avoid.
 
+${LANGUAGE_POLICY}
+- In this lesson: "problemStatement" is an exam question, so write it in English. "title", "intuition", "sections", "steps", "finalAnswer", "takeaway", and "commonPitfalls" are explanations: write them in Turkish with the key technical terms in English.
+
 Rules:
-- Write ALL text in ${detectedLanguage || 'English'}.
 - Wrap all math symbols, equations, integrals, matrices, and Greek letters in valid KaTeX LaTeX ($...$ inline, $$...$$ display).`,
       };
 
@@ -791,7 +834,7 @@ Rules:
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are an inspiring university engineering professor teaching a focused mini-lesson before a mastery quiz. Be concise, crystal clear, intuition-first, and mathematically rigorous. Output strict JSON.',
+              'You are an inspiring university engineering professor teaching a focused mini-lesson that prepares students for your own exam. Be concise, crystal clear, intuition-first, and mathematically rigorous. Explain in Turkish, keep key technical terms in English, and write exam problem statements in English. Output strict JSON.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             responseMimeType: 'application/json',
             responseSchema: {
@@ -880,14 +923,16 @@ Rules:
         .join('\n');
 
       const promptPart: Part = {
-        text: `Course: ${courseName} (Language: ${detectedLanguage || 'English'})
+        text: `Course: ${courseName} (Source Material Language: ${detectedLanguage || 'English'})
 Level ${level.levelNumber}: ${level.title}
 Key Formulas: ${level.keyFormulas.join('; ')}
 Lesson Context: ${lessonSummary.slice(0, 2200)}
 ${recentHistory ? `\nRecent Doubt Q&A:\n${recentHistory}\n` : ''}
 Student's Quick Doubt: "${doubtQuestion.trim()}"
 
-Give a clear, direct, intuition-first answer (3–6 sentences or concise bullet steps) using KaTeX ($...$ / $$...$$) in the same language as the student's question (or ${detectedLanguage || 'English'}).`,
+Give a clear, direct, intuition-first answer (3–6 sentences or concise bullet steps) using KaTeX ($...$ / $$...$$). If relevant, say briefly how this point typically shows up on exams.
+
+${LANGUAGE_POLICY}`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
@@ -896,7 +941,7 @@ Give a clear, direct, intuition-first answer (3–6 sentences or concise bullet 
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are a patient engineering professor answering a quick student doubt during a mini-lesson. Be crisp, concrete, and use KaTeX math.',
+              'You are a patient engineering professor answering a quick student doubt during a mini-lesson. Be crisp, concrete, and use KaTeX math. Answer in Turkish, keeping key technical terms in English.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
             responseMimeType: 'application/json',
             responseSchema: {
@@ -941,13 +986,14 @@ Give a clear, direct, intuition-first answer (3–6 sentences or concise bullet 
       };
 
       const ai = await getAiClient(res);
-      const pdfParts = buildPdfParts(pdfs, 2);
-      const compactDigest = (courseDigest || '').slice(0, 2200);
+      // 2 level PDFs + up to 1 past exam / problem set added by the client
+      const pdfParts = buildPdfParts(pdfs, 3);
+      const compactDigest = (courseDigest || '').slice(0, 3000);
 
       const promptPart: Part = {
         text: `Course: ${courseName}
-Course Language: ${detectedLanguage || 'English'}
-Course Syllabus Summary: ${compactDigest}
+Source Material Language: ${detectedLanguage || 'English'}
+Course Syllabus Summary (incl. likely exam archetypes): ${compactDigest}
 
 Target Level: Level ${level.levelNumber} — "${level.title}" (Tier: ${level.tier})
 Level Summary: ${level.summary}
@@ -955,27 +1001,38 @@ Objectives: ${level.objectives.join('; ')}
 Key Formulas: ${level.keyFormulas.join('; ')}
 Source Grounding: ${level.sourceExcerpt}
 
-Generate exactly 5 targeted active-recall questions for this specific level, strictly grounded in the 1–2 attached PDFs and course material above.
-Difficulty calibration:
-- foundation (1-2): 3 conceptual intuition checks + 2 simple foundational checks.
-- application (3-5): 2 conceptual checks + 3 standard single-step engineering/math problems.
-- exam (6-8): 1 conceptual synthesis + 4 exam-level multi-step engineering problems modeled after past exams.
-- distinction (9-10): 5 rigorous distinction-level multi-step derivations, coupled systems, or edge-case problems.
+${describeExamReferences(pdfs)}
+
+${EXAM_PROFESSOR_GUIDE}
+
+Task: Write exactly 5 exam questions for this level, the way they would appear on your midterm/final. Every question must directly test the objectives and key formulas of THIS level.
+Difficulty calibration by tier:
+- foundation (1-2): 2 short "explain why / which and why" conceptual exam questions + 3 short computational exam questions on the core definitions and formulas.
+- application (3-5): 1 conceptual exam question + 4 standard exam problems that apply the level's key formulas to concrete given data.
+- exam (6-8): 5 full exam-length multi-step problems (multi-part (a)(b)(c) where natural) of the type that carries the most points on a real exam.
+- distinction (9-10): 5 hardest-question-on-the-exam problems: derivations, coupled/combined topics, proofs, or edge cases that separate an A from a B.
+
+For each question:
+- "examRationale": one short line (Turkish, technical terms in English) on why a professor would ask this on the exam / which exam archetype it is.
+- "prompt": the full exam question text, in English.
+- "hint": a short nudge toward the method without giving the answer, in Turkish with the technical terms in English.
+- "targetConcepts": 1–3 concept names, in English.
+- "kind": "conceptual" or "problem".
+
+${LANGUAGE_POLICY}
 
 Formatting rules:
-- Write ALL text in ${detectedLanguage || 'English'}.
 - Render all mathematical notation, equations, integrals, matrices, and Greek letters in valid KaTeX LaTeX wrapped in $...$ (inline) or $$...$$ (display).
-- Each question requires an open-ended written solution from the student.`,
+- Each question requires an open-ended written solution from the student (no multiple choice).`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
         ai.models.generateContent({
-          model: FAST_MODEL_ID,
+          model: MODEL_ID,
           contents: { parts: [...pdfParts, promptPart] },
           config: {
-            systemInstruction:
-              'You are a strict, encouraging university engineering professor designing targeted level-mastery questions from the student’s own lecture materials. Respond in the detected course language.',
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            systemInstruction: `${EXAM_PROFESSOR_GUIDE}\n\nQuestion text must be in English; hints and rationales in Turkish with technical terms in English. Output strict JSON.`,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -987,6 +1044,7 @@ Formatting rules:
                     properties: {
                       id: { type: Type.STRING },
                       index: { type: Type.INTEGER },
+                      examRationale: { type: Type.STRING },
                       kind: { type: Type.STRING, description: 'conceptual or problem' },
                       prompt: { type: Type.STRING },
                       hint: { type: Type.STRING },
@@ -995,7 +1053,7 @@ Formatting rules:
                         items: { type: Type.STRING },
                       },
                     },
-                    required: ['id', 'index', 'kind', 'prompt', 'hint', 'targetConcepts'],
+                    required: ['id', 'index', 'examRationale', 'kind', 'prompt', 'hint', 'targetConcepts'],
                   },
                 },
               },
@@ -1059,7 +1117,7 @@ Formatting rules:
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const promptPart: Part = {
-        text: `Course: ${courseName} (Language: ${detectedLanguage || 'English'})
+        text: `Course: ${courseName} (Source Material Language: ${detectedLanguage || 'English'})
 Context: ${(courseDigest || '').slice(0, 1800)}
 Level ${level.levelNumber}: ${level.title} (${level.tier})
 Grounding: ${level.sourceExcerpt}
@@ -1075,9 +1133,12 @@ ${userAnswer}
 """
 
 Grade this solution carefully:
-1. Score from 0 to 100 based on correctness, valid method, boundary conditions, and units/notation.
-2. In "stepFeedback", explicitly identify which step is right or WHY a specific step in the student's work is wrong (or missing). If the student responded in a specific language (e.g. Turkish, Italian, English), respond in that language (otherwise use ${detectedLanguage || 'English'}).
-3. In "workedSolution", provide the clean canonical step-by-step derivation using KaTeX LaTeX ($...$ and $$...$$).`,
+1. Score from 0 to 100 the way you would grade it on a real exam (partial credit for a correct method), based on correctness, valid method, boundary conditions, and units/notation.
+2. In "stepFeedback", explicitly identify which step is right or WHY a specific step in the student's work is wrong (or missing).
+3. In "workedSolution", provide the clean canonical step-by-step derivation using KaTeX LaTeX ($...$ and $$...$$), as it would appear in the official exam solution key.
+
+${LANGUAGE_POLICY}
+- "verdict", "stepFeedback", and the explanations in "workedSolution" are explanations: write them in Turkish with the key technical terms in English. The student may answer in any language.`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
@@ -1086,7 +1147,7 @@ Grade this solution carefully:
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are an engineering exam grader. Be fair, precise, and diagnostic. Explain exactly why any erroneous step fails mathematically or physically. Wrap all math in $...$ or $$...$$.',
+              'You are the professor grading your own engineering exam. Be fair, precise, and diagnostic. Explain exactly why any erroneous step fails mathematically or physically. Write feedback in Turkish, keeping key technical terms in English. Wrap all math in $...$ or $$...$$.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
             responseMimeType: 'application/json',
             responseSchema: {
@@ -1146,31 +1207,39 @@ Grade this solution carefully:
       };
 
       const ai = await getAiClient(res);
-      const pdfParts = buildPdfParts(pdfs, 2);
+      // 2 level PDFs + up to 1 past exam / problem set added by the client
+      const pdfParts = buildPdfParts(pdfs, 3);
 
       const promptPart: Part = {
-        text: `Course: ${courseName} (Language: ${detectedLanguage || 'English'})
-Course Digest: ${(courseDigest || '').slice(0, 1800)}
+        text: `Course: ${courseName} (Source Material Language: ${detectedLanguage || 'English'})
+Course Digest (incl. likely exam archetypes): ${(courseDigest || '').slice(0, 2400)}
 Level ${level.levelNumber}: ${level.title} (${level.tier})
 Key Formulas: ${level.keyFormulas.join('; ')}
 Source Grounding: ${level.sourceExcerpt}
 
-Generate ONE realistic, exam-style engineering problem modeled after the course PDFs and past exams.
+${describeExamReferences(pdfs)}
+
+${EXAM_PROFESSOR_GUIDE}
+
+Task: Write ONE realistic exam problem for this level, exactly as it would appear on your midterm/final, using this level's key formulas.
 The problem should be rich enough that an anxious student might freeze at the start, requiring them to identify:
 - Line 1: Which governing theorem, law, or formula applies.
 - Line 2: The knowns/unknowns and initial setup equation.
 
-Write everything in ${detectedLanguage || 'English'}. Use KaTeX $...$ and $$...$$ for all math.`,
+Language:
+- "problemText": the exam problem, entirely in English.
+- "sourceContext" and "expectedFocus": in Turkish, keeping the key technical terms in English.
+Use KaTeX $...$ and $$...$$ for all math.`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
         ai.models.generateContent({
-          model: FAST_MODEL_ID,
+          model: MODEL_ID,
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are an engineering exam coach training students to overcome exam freeze by spotting the exact starting equation within 45 seconds.',
-            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+              'You are the professor who writes this course\'s exams, training students to overcome exam freeze by spotting the exact starting equation within 45 seconds. Problems must be realistic, high-yield exam problems written in English.',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -1227,7 +1296,7 @@ Write everything in ${detectedLanguage || 'English'}. Use KaTeX $...$ and $$...$
       const pdfParts = buildPdfParts(pdfs, 2);
 
       const promptPart: Part = {
-        text: `Course: ${courseName} (Language: ${detectedLanguage || 'English'})
+        text: `Course: ${courseName} (Source Material Language: ${detectedLanguage || 'English'})
 Level ${level.levelNumber}: ${level.title}
 
 Exam Problem:
@@ -1244,7 +1313,8 @@ Evaluate strictly:
 4. missingOrWrong: Specific assumptions, signs, boundary conditions, or variables missed (or affirm completeness if valid).
 5. optimalFirstTwoLines: Show the ideal crisp Line 1 + Line 2 setup in KaTeX ($...$ and $$...$$).
 
-Respond in the language of the student's input or ${detectedLanguage || 'English'}.`,
+${LANGUAGE_POLICY}
+- "trajectoryAssessment", "missingOrWrong", and "optimalFirstTwoLines" are explanations: write them in Turkish with the key technical terms in English. The student may answer in any language.`,
       };
 
       const response: GenerateContentResponse = await withRetry(() =>
@@ -1352,7 +1422,7 @@ Respond in the language of the student's input or ${detectedLanguage || 'English
               .join('\n\n');
 
       const promptPart: Part = {
-        text: `Course: ${courseName} (Primary Language: ${detectedLanguage || 'English'})
+        text: `Course: ${courseName} (Source Material Language: ${detectedLanguage || 'English'})
 Course Digest: ${(courseDigest || '').slice(0, 1800)}
 Current Level: Level ${level.levelNumber} — "${level.title}"
 Summary: ${level.summary}
@@ -1364,9 +1434,9 @@ ${transcript}
 
 Instructions:
 - Roleplay as a sharp but genuinely confused engineering classmate trying to understand a core concept from Level ${level.levelNumber}.
-- If the conversation has not started yet (0 messages), pick ONE pivotal concept from Level ${level.levelNumber} and ask the user to explain it in plain terms (e.g., "Hey, I'm totally lost on why ... works in this chapter — can you walk me through it from scratch?").
-- If the student has just explained something, DO NOT give away the textbook answer! Instead, probe for logical gaps, hand-waving ("wait, why does that term cancel out?" or "what if the boundary condition changes?"), and ask one focused follow-up question.
-- Language rule: Respond in the same language the student uses, or ${detectedLanguage || 'English'} at the start.
+- If the conversation has not started yet (0 messages), pick ONE pivotal, exam-relevant concept from Level ${level.levelNumber} (one the professor is likely to test) and ask the user to explain it in plain terms (e.g., "Hocam bu bölümde ... neden çalışıyor hiç anlamadım, baştan anlatır mısın?").
+- If the student has just explained something, DO NOT give away the textbook answer! Instead, probe for logical gaps, hand-waving ("wait, why does that term cancel out?" or "what if the boundary condition changes?"), and ask one focused follow-up question — the kind of follow-up an exam question would test.
+- Language rule: Speak in Turkish, keeping key technical terms in English (e.g. "boundary condition", "eigenvalue", "transfer function"). "turnAssessment", "strengths", and "gaps" follow the same rule.
 - Use KaTeX $...$ for any math expressions.
 - Scoring trigger: ${
           forceEvaluate
@@ -1383,7 +1453,7 @@ Instructions:
           contents: { parts: [...pdfParts, promptPart] },
           config: {
             systemInstruction:
-              'You are a confused engineering classmate in a Feynman Teach-Back session. Be curious, concise, and mathematically sharp. Spot hand-waving immediately.',
+              'You are a confused engineering classmate in a Feynman Teach-Back session. Be curious, concise, and mathematically sharp. Spot hand-waving immediately. Speak Turkish, keeping key technical terms in English.',
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: {
